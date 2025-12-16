@@ -125,19 +125,6 @@ TOOLS = [
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": True
-        },
-        "usage": {
-            "prerequisite": None,
-            "instructions": [
-                "Call with repository name only",
-                "Wait for success confirmation",
-                "Then use other tools to explore"
-            ],
-            "example": {
-                "call": "clone_repository",
-                "arguments": {"repo_name": "CLARIOERP_WMS"}
-            },
-            "returns": ["status", "message", "path"]
         }
     },
     {
@@ -177,19 +164,6 @@ TOOLS = [
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False
-        },
-        "usage": {
-            "prerequisite": "clone_repository",
-            "instructions": [
-                "Provide repo_name exactly as used in clone",
-                "Use pattern for search term",
-                "Optionally filter by file type"
-            ],
-            "example": {
-                "call": "search_code",
-                "arguments": {"repo_name": "CLARIOERP_WMS", "pattern": "async function", "file_pattern": "*.ts"}
-            },
-            "returns": ["matches[].file", "matches[].line", "matches[].content"]
         }
     },
     {
@@ -226,19 +200,6 @@ TOOLS = [
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False
-        },
-        "usage": {
-            "prerequisite": "clone_repository",
-            "instructions": [
-                "Provide repo_name exactly as used in clone",
-                "Use path to focus on subdirectory",
-                "Path is relative to repo root (not including repo name)"
-            ],
-            "example": {
-                "call": "get_tree",
-                "arguments": {"repo_name": "CLARIOERP_WMS", "path": "src", "max_depth": 2}
-            },
-            "returns": ["tree", "truncated"]
         }
     },
     {
@@ -274,20 +235,6 @@ TOOLS = [
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False
-        },
-        "usage": {
-            "prerequisite": "clone_repository",
-            "instructions": [
-                "Provide repo_name exactly as used in clone",
-                "file_path is relative to repo root",
-                "Do NOT include repo name in file_path",
-                "Use line ranges for large files"
-            ],
-            "example": {
-                "call": "read_file",
-                "arguments": {"repo_name": "CLARIOERP_WMS", "file_path": "src/App.tsx", "start_line": 1, "end_line": 50}
-            },
-            "returns": ["content", "total_lines", "file_size"]
         }
     },
     {
@@ -313,19 +260,6 @@ TOOLS = [
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False
-        },
-        "usage": {
-            "prerequisite": "clone_repository",
-            "instructions": [
-                "Provide repo_name exactly as used in clone",
-                "file_path is relative to repo root",
-                "Best for .py, .js, .ts, .jsx, .tsx files"
-            ],
-            "example": {
-                "call": "get_outline",
-                "arguments": {"repo_name": "CLARIOERP_WMS", "file_path": "src/services/api.ts"}
-            },
-            "returns": ["outline[].type", "outline[].name", "outline[].line"]
         }
     }
 ]
@@ -380,7 +314,7 @@ async def clone_repository_impl(repo_name: str) -> dict:
 
     if not validate_repo_name(repo_name):
         logger.warning(f"[TOOL:clone_repository] Invalid repo name: {repo_name}")
-        return {"error": "Invalid repository name", "success": False, "retryable": False}
+        return {"error": "Invalid repository name", "success": False}
 
     repo_path = get_repo_path(repo_name)
     logger.debug(f"[TOOL:clone_repository] repo_path={repo_path}")
@@ -397,7 +331,7 @@ async def clone_repository_impl(repo_name: str) -> dict:
             )
             return {
                 "status": "updated",
-                "message": f"Repository '{repo_name}' updated with latest changes",
+                "message": f"Repository '{repo_name}' updated",
                 "path": str(repo_path),
                 "success": True
             }
@@ -420,7 +354,7 @@ async def clone_repository_impl(repo_name: str) -> dict:
     # Clone the repository
     repo_path.parent.mkdir(parents=True, exist_ok=True)
     clone_url = f"https://github.com/{ALLOWED_USERNAME}/{repo_name}.git"
-
+    
     if GITHUB_PAT:
         clone_url = f"https://{GITHUB_PAT}@github.com/{ALLOWED_USERNAME}/{repo_name}.git"
 
@@ -438,8 +372,7 @@ async def clone_repository_impl(repo_name: str) -> dict:
             return {
                 "error": f"Clone failed: {result.stderr}",
                 "success": False,
-                "retryable": True,
-                "retry_after": 5
+                "retryable": True
             }
 
         return {
@@ -473,89 +406,101 @@ async def search_code_impl(
     case_sensitive: bool = False,
     max_results: int = 20
 ) -> dict:
-    """Search for code patterns in a repository"""
-    logger.info(f"[TOOL:search_code] repo={repo_name}, pattern={pattern}")
+    """
+    Search for code patterns in a repository.
+    
+    FIXED: Returns substantive response even when no matches found,
+    preventing tool eviction from sparse responses.
+    """
+    logger.info(f"[TOOL:search_code] repo={repo_name}, pattern={pattern}, file_pattern={file_pattern}")
 
     if not validate_repo_name(repo_name):
-        return {"error": "Invalid repository name", "matches": [], "success": False, "retryable": False}
+        return {
+            "error": "Invalid repository name. Use alphanumeric characters, hyphens, underscores, and dots only.",
+            "matches": [],
+            "success": False,
+            "retryable": False,
+            "pattern": pattern,
+            "repository": repo_name
+        }
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
         return {
-            "error": f"Repository not found. Call clone_repository first.",
+            "error": f"Repository '{repo_name}' not found. You must call clone_repository first.",
             "matches": [],
             "success": False,
-            "retryable": False
+            "retryable": False,
+            "suggestion": f"Call clone_repository with repo_name='{repo_name}' before searching.",
+            "pattern": pattern,
+            "repository": repo_name
         }
 
-    # Fix common mistake: strip repo name from pattern if included
-    if pattern.startswith(repo_name + "/"):
-        pattern = pattern[len(repo_name) + 1:]
-
+    # Build grep command with proper argument ordering
     cmd = ["grep", "-r", "-n", "--include", file_pattern or "*"]
     if not case_sensitive:
         cmd.append("-i")
-    cmd.append("--")
+    cmd.append("--")  # End of options marker
     cmd.append(pattern)
     cmd.append(str(repo_path))
 
     try:
-        process = subprocess.Popen(
+        result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            capture_output=True,
+            text=True,
+            timeout=30
         )
 
         matches = []
-        try:
-            for line in process.stdout:
-                if len(matches) >= max_results:
-                    process.terminate()
-                    break
-
+        if result.stdout:
+            for line in result.stdout.split("\n")[:max_results]:
                 if ":" in line:
                     parts = line.split(":", 2)
                     if len(parts) >= 3:
                         file_path = parts[0].replace(str(repo_path) + "/", "")
                         line_num = parts[1]
-                        content = parts[2].strip()[:200]
+                        content = parts[2][:200].strip()
                         matches.append({
                             "file": file_path,
                             "line": int(line_num) if line_num.isdigit() else 0,
                             "content": content
                         })
-        finally:
-            if process.stdout:
-                process.stdout.close()
-            if process.stderr:
-                process.stderr.close()
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=5)
 
+        total_in_output = len(result.stdout.split("\n")) if result.stdout else 0
+
+        # CRITICAL: Always return complete, substantive response
         return {
             "matches": matches,
-            "total_matches": len(matches),
+            "total": len(matches),
+            "truncated": total_in_output > max_results,
+            "success": True,
+            "search_completed": True,
             "pattern": pattern,
-            "truncated": len(matches) >= max_results,
-            "success": True
+            "repository": repo_name,
+            "file_filter": file_pattern or "*",
+            "case_sensitive": case_sensitive
         }
 
     except subprocess.TimeoutExpired:
         return {
-            "error": "Search timed out",
+            "error": "Search operation timed out after 30 seconds. Try a more specific pattern or file filter.",
             "matches": [],
             "success": False,
             "retryable": True,
-            "retry_after": 5
+            "retry_after": 5,
+            "pattern": pattern,
+            "repository": repo_name
         }
     except Exception as e:
+        logger.error(f"[TOOL:search_code] Error: {e}", exc_info=True)
         return {
-            "error": str(e),
+            "error": f"Search failed: {str(e)}",
             "matches": [],
             "success": False,
-            "retryable": True
+            "retryable": True,
+            "pattern": pattern,
+            "repository": repo_name
         }
 
 
@@ -569,60 +514,47 @@ async def get_tree_impl(
     logger.info(f"[TOOL:get_tree] repo={repo_name}, path={path}")
 
     if not validate_repo_name(repo_name):
-        return {"error": "Invalid repository name", "tree": "", "success": False, "retryable": False}
+        return {"error": "Invalid repository name", "tree": "", "success": False}
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
         return {
             "error": f"Repository not found. Call clone_repository first.",
             "tree": "",
-            "success": False,
-            "retryable": False
+            "success": False
         }
-
-    # Fix common mistake: strip repo name from path if included
-    if path.startswith(repo_name + "/"):
-        path = path[len(repo_name) + 1:]
-    elif path == repo_name:
-        path = "."
 
     target_path = validate_file_path(repo_path, path)
     if target_path is None:
         target_path = repo_path
 
-    if not target_path.exists():
-        return {"error": f"Path '{path}' does not exist", "tree": "", "success": False, "retryable": False}
-
-    MAX_TREE_LINES = 200
-    line_count = [0]
-
     def build_tree(dir_path: Path, prefix: str = "", depth: int = 0) -> list:
-        if depth > max_depth or line_count[0] >= MAX_TREE_LINES:
+        if depth > max_depth:
             return []
 
         lines = []
         try:
             entries = sorted(dir_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
             entries = [e for e in entries if show_hidden or not e.name.startswith(".")]
-            entries = [e for e in entries if e.name not in ["node_modules", "__pycache__", ".git", "venv", ".venv"]]
+            entries = [e for e in entries if e.name not in ["node_modules", "__pycache__", ".git", "venv"]]
 
             for i, entry in enumerate(entries):
-                if line_count[0] >= MAX_TREE_LINES:
-                    break
-
                 is_last = i == len(entries) - 1
-                connector = "+-- " if is_last else "|-- "
+                connector = "└── " if is_last else "├── "
                 size_info = ""
                 if entry.is_file():
                     size = entry.stat().st_size
-                    size_info = f" ({size:,} bytes)" if size < 1024 * 1024 else f" ({size // 1024 // 1024:.1f} MB)"
+                    size_info = f" ({size} bytes)" if size < 10000 else f" ({size//1024}KB)"
 
                 lines.append(f"{prefix}{connector}{entry.name}{size_info}")
-                line_count[0] += 1
 
                 if entry.is_dir():
-                    extension = "    " if is_last else "|   "
+                    extension = "    " if is_last else "│   "
                     lines.extend(build_tree(entry, prefix + extension, depth + 1))
+
+                if len(lines) > 200:
+                    lines.append(f"{prefix}... (truncated)")
+                    break
 
         except PermissionError:
             lines.append(f"{prefix}[Permission denied]")
@@ -630,22 +562,14 @@ async def get_tree_impl(
         return lines
 
     tree_lines = [f"{repo_name}/"]
-    line_count[0] = 1
     tree_lines.extend(build_tree(target_path))
+    tree = "\n".join(tree_lines[:200])
 
-    truncated = line_count[0] >= MAX_TREE_LINES
-
-    result = {
-        "tree": "\n".join(tree_lines),
-        "repo_name": repo_name,
-        "path": path,
-        "truncated": truncated,
+    return {
+        "tree": tree,
+        "truncated": len(tree_lines) > 200,
         "success": True
     }
-    if truncated:
-        result["note"] = f"Output limited to {MAX_TREE_LINES} lines. Use path parameter to explore subdirectories."
-
-    return result
 
 
 async def read_file_impl(
@@ -658,79 +582,50 @@ async def read_file_impl(
     logger.info(f"[TOOL:read_file] repo={repo_name}, file={file_path}")
 
     if not validate_repo_name(repo_name):
-        return {"error": "Invalid repository name", "content": "", "success": False, "retryable": False}
+        return {"error": "Invalid repository name", "content": "", "success": False}
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
         return {
             "error": f"Repository not found. Call clone_repository first.",
             "content": "",
-            "success": False,
-            "retryable": False
+            "success": False
         }
-
-    # Fix common mistake: strip repo name from file_path if included
-    if file_path.startswith(repo_name + "/"):
-        file_path = file_path[len(repo_name) + 1:]
 
     full_path = validate_file_path(repo_path, file_path)
     if full_path is None:
-        return {"error": "Invalid file path", "content": "", "success": False, "retryable": False}
+        return {"error": "Invalid file path", "content": "", "success": False}
 
     if not full_path.exists():
-        return {"error": f"File not found: {file_path}", "content": "", "success": False, "retryable": False}
+        return {"error": f"File not found: {file_path}", "content": "", "success": False}
 
     if not full_path.is_file():
-        return {"error": f"Not a file: {file_path}", "content": "", "success": False, "retryable": False}
+        return {"error": f"Not a file: {file_path}", "content": "", "success": False}
 
     try:
-        file_size = full_path.stat().st_size
-        if file_size > 1024 * 1024:  # 1MB limit
-            return {
-                "error": f"File too large ({file_size // 1024 // 1024:.1f} MB). Maximum is 1MB.",
-                "content": "",
-                "success": False,
-                "retryable": False
-            }
-
         with open(full_path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
 
         total_lines = len(lines)
-        MAX_LINES = 200
-
         start_idx = max(0, start_line - 1)
-        if end_line <= 0:
-            end_idx = min(start_idx + MAX_LINES, total_lines)
-        else:
-            end_idx = min(end_line, start_idx + MAX_LINES, total_lines)
+        end_idx = end_line if end_line > 0 else min(start_idx + 200, total_lines)
 
         selected_lines = lines[start_idx:end_idx]
-        was_truncated = (end_line <= 0 and total_lines > end_idx) or (end_line > 0 and end_line > end_idx)
-
         numbered_lines = [
-            f"{start_idx + i + 1:>4} | {line.rstrip()}"
+            f"{start_idx + i + 1:>6} | {line.rstrip()}"
             for i, line in enumerate(selected_lines)
         ]
 
-        result = {
+        return {
             "content": "\n".join(numbered_lines),
-            "file_path": file_path,
-            "repo_name": repo_name,
+            "file": file_path,
             "start_line": start_idx + 1,
-            "end_line": end_idx,
+            "end_line": min(end_idx, total_lines),
             "total_lines": total_lines,
-            "file_size": file_size,
+            "file_size": full_path.stat().st_size,
             "success": True
         }
-        if was_truncated:
-            result["truncated"] = True
-            result["note"] = f"Output limited to {MAX_LINES} lines. Use start_line/end_line to read other sections."
 
-        return result
-
-    except UnicodeDecodeError:
-        return {"error": "Cannot read binary file", "content": "", "success": False, "retryable": False}
     except Exception as e:
         return {
             "error": str(e),
@@ -745,27 +640,22 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
     logger.info(f"[TOOL:get_outline] repo={repo_name}, file={file_path}")
 
     if not validate_repo_name(repo_name):
-        return {"error": "Invalid repository name", "outline": [], "success": False, "retryable": False}
+        return {"error": "Invalid repository name", "outline": [], "success": False}
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
         return {
             "error": f"Repository not found. Call clone_repository first.",
             "outline": [],
-            "success": False,
-            "retryable": False
+            "success": False
         }
-
-    # Fix common mistake: strip repo name from file_path if included
-    if file_path.startswith(repo_name + "/"):
-        file_path = file_path[len(repo_name) + 1:]
 
     full_path = validate_file_path(repo_path, file_path)
     if full_path is None:
-        return {"error": "Invalid file path", "outline": [], "success": False, "retryable": False}
+        return {"error": "Invalid file path", "outline": [], "success": False}
 
     if not full_path.exists():
-        return {"error": f"File not found: {file_path}", "outline": [], "success": False, "retryable": False}
+        return {"error": f"File not found: {file_path}", "outline": [], "success": False}
 
     try:
         with open(full_path, "r", encoding="utf-8", errors="replace") as f:
@@ -784,28 +674,13 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
                             "name": node.name,
                             "line": node.lineno
                         })
-                        for item in node.body:
-                            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                outline.append({
-                                    "type": "method",
-                                    "name": f"{node.name}.{item.name}",
-                                    "line": item.lineno
-                                })
-                    elif isinstance(node, ast.FunctionDef) and not any(
-                        isinstance(parent, ast.ClassDef)
-                        for parent in ast.walk(tree)
-                        if hasattr(parent, 'body') and node in getattr(parent, 'body', [])
-                    ):
+                    elif isinstance(node, ast.FunctionDef):
                         outline.append({
                             "type": "function",
                             "name": node.name,
                             "line": node.lineno
                         })
-                    elif isinstance(node, ast.AsyncFunctionDef) and not any(
-                        isinstance(parent, ast.ClassDef)
-                        for parent in ast.walk(tree)
-                        if hasattr(parent, 'body') and node in getattr(parent, 'body', [])
-                    ):
+                    elif isinstance(node, ast.AsyncFunctionDef):
                         outline.append({
                             "type": "async_function",
                             "name": node.name,
@@ -831,23 +706,11 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
                             "line": line_num
                         })
 
-        # Generic fallback
-        else:
-            for match in re.finditer(r'^(?:def|func|function|fn|pub fn|async fn)\s+(\w+)', content, re.MULTILINE):
-                line_num = content[:match.start()].count('\n') + 1
-                outline.append({"type": "function", "name": match.group(1), "line": line_num})
-
-            for match in re.finditer(r'^(?:class|struct|type|interface)\s+(\w+)', content, re.MULTILINE):
-                line_num = content[:match.start()].count('\n') + 1
-                outline.append({"type": "class", "name": match.group(1), "line": line_num})
-
         outline.sort(key=lambda x: x["line"])
 
         return {
             "outline": outline,
-            "file_path": file_path,
-            "repo_name": repo_name,
-            "file_type": ext,
+            "file": file_path,
             "total_items": len(outline),
             "success": True
         }
@@ -866,114 +729,105 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
 # ============================================================================
 
 def format_result_as_markdown(tool_name: str, result: dict) -> str:
-    """Format tool result as markdown for better readability"""
+    """
+    Format tool result as markdown for better readability.
+    
+    FIXED: Provides substantive content for empty search results,
+    preventing tool eviction from sparse responses.
+    """
+    lines = [f"## {tool_name.replace('_', ' ').title()}\n"]
+
     if "error" in result:
-        lines = [
-            f"## Error\n",
-            f"**Tool:** `{tool_name}`",
-            f"**Error:** {result['error']}"
-        ]
+        lines.append(f"**Error:** {result['error']}\n")
+        if result.get("suggestion"):
+            lines.append(f"**Suggestion:** {result['suggestion']}\n")
         if result.get("retryable"):
-            lines.append("\n*This operation can be retried.*")
-        lines.append("\n**Suggestion:** Make sure the repository is cloned first using `clone_repository`.")
+            lines.append("*This operation can be retried.*\n")
         return "\n".join(lines)
 
     if tool_name == "clone_repository":
-        status = "SUCCESS" if result.get("success") else "FAILED"
-        return f"""## Clone Repository - {status}
-
-**Status:** {result.get('status', 'unknown')}
-**Message:** {result.get('message', 'No message')}
-**Path:** `{result.get('path', 'N/A')}`
-
-The repository is now available for exploration with other tools."""
+        lines.append(f"**Status:** {result.get('status', 'unknown')}")
+        lines.append(f"**Message:** {result.get('message', '')}")
+        lines.append(f"**Path:** `{result.get('path', '')}`")
+        lines.append("")
+        lines.append("The repository is now available for exploration with other tools.")
 
     elif tool_name == "search_code":
         matches = result.get("matches", [])
-        total = result.get("total_matches", len(matches))
-        truncated = result.get("truncated", False)
-
-        if not matches:
-            return f"""## Search Results
-
-**Pattern:** `{result.get('pattern', '')}`
-**Matches:** 0
-
-No matches found."""
-
-        lines = [f"""## Search Results
-
-**Pattern:** `{result.get('pattern', '')}`
-**Matches:** {total}{' (truncated)' if truncated else ''}
-
-### Matches:
-"""]
-        for m in matches[:20]:
-            lines.append(f"- **{m['file']}** (line {m['line']}): `{m['content'][:100]}`")
-
-        return "\n".join(lines)
+        pattern = result.get("pattern", "unknown")
+        repo = result.get("repository", "unknown")
+        file_filter = result.get("file_filter", "*")
+        case_sensitive = result.get("case_sensitive", False)
+        
+        lines.append(f"**Pattern:** `{pattern}`")
+        lines.append(f"**Repository:** `{repo}`")
+        lines.append(f"**File Filter:** `{file_filter}`")
+        lines.append(f"**Case Sensitive:** {case_sensitive}")
+        lines.append(f"**Matches Found:** {len(matches)}")
+        
+        if result.get("truncated"):
+            lines.append("*(Results truncated to first 20 matches)*")
+        
+        lines.append("")
+        
+        if matches:
+            lines.append("### Matches:\n")
+            for m in matches:
+                file_name = m.get('file', 'unknown')
+                line_num = m.get('line', 0)
+                content = m.get('content', '')[:100]
+                lines.append(f"- **{file_name}** (line {line_num}): `{content}`")
+        else:
+            # CRITICAL FIX: Substantive message for no results
+            lines.append("### Result: No Matches Found\n")
+            lines.append(f"The search for pattern `{pattern}` completed successfully but found no matches in repository `{repo}`.")
+            lines.append("")
+            lines.append("**Possible reasons:**")
+            lines.append("- The pattern does not exist in the codebase")
+            lines.append("- The pattern may use different casing (search is case-insensitive by default)")
+            lines.append("- The file filter may be excluding relevant files")
+            lines.append("")
+            lines.append("**Suggestions:**")
+            lines.append("- Try a different or broader search pattern")
+            lines.append("- Adjust the file filter (e.g., use `*` for all files)")
+            lines.append("- Use `get_tree` to explore the repository structure")
+            lines.append("- Try searching for partial terms or common variations")
 
     elif tool_name == "get_tree":
-        tree = result.get("tree", "")
-        truncated = result.get("truncated", False)
-
-        return f"""## Directory Tree
-
-**Repository:** `{result.get('repo_name', '')}`
-**Path:** `{result.get('path', '.')}`
-{f"**Note:** {result.get('note', '')}" if truncated else ""}
-
-```
-{tree}
-```"""
+        tree_content = result.get("tree", "")
+        lines.append("```")
+        lines.append(tree_content if tree_content else "(empty directory)")
+        lines.append("```")
+        if result.get("truncated"):
+            lines.append("\n*(Tree truncated to 200 lines. Use path parameter to explore subdirectories.)*")
 
     elif tool_name == "read_file":
+        lines.append(f"**File:** `{result.get('file', '')}`")
+        lines.append(f"**Lines:** {result.get('start_line', 1)}-{result.get('end_line', 0)} of {result.get('total_lines', 0)}")
+        lines.append(f"**Size:** {result.get('file_size', 0)} bytes\n")
         content = result.get("content", "")
-        truncated = result.get("truncated", False)
-
-        return f"""## File Contents
-
-**Repository:** `{result.get('repo_name', '')}`
-**File:** `{result.get('file_path', '')}`
-**Lines:** {result.get('start_line', 1)}-{result.get('end_line', '?')} of {result.get('total_lines', '?')}
-**Size:** {result.get('file_size', 0):,} bytes
-{f"**Note:** {result.get('note', '')}" if truncated else ""}
-
-```
-{content}
-```"""
+        lines.append("```")
+        lines.append(content if content else "(empty file)")
+        lines.append("```")
+        
+        if result.get('end_line', 0) < result.get('total_lines', 0):
+            remaining = result.get('total_lines', 0) - result.get('end_line', 0)
+            lines.append(f"\n*{remaining} more lines available. Use start_line/end_line parameters to read additional content.*")
 
     elif tool_name == "get_outline":
         outline = result.get("outline", [])
+        lines.append(f"**File:** `{result.get('file', '')}`")
+        lines.append(f"**Items Found:** {len(outline)}\n")
+        
+        if outline:
+            for item in outline:
+                lines.append(f"- `{item['type']}` **{item['name']}** (line {item['line']})")
+        else:
+            lines.append("No classes, functions, or methods detected in this file.")
+            lines.append("")
+            lines.append("*Note: Outline extraction works best with Python (.py), JavaScript (.js), TypeScript (.ts, .tsx), and JSX (.jsx) files.*")
 
-        if not outline:
-            return f"""## Code Outline
-
-**File:** `{result.get('file_path', '')}`
-**Type:** `{result.get('file_type', '')}`
-
-No classes or functions found."""
-
-        lines = [f"""## Code Outline
-
-**File:** `{result.get('file_path', '')}`
-**Type:** `{result.get('file_type', '')}`
-**Items:** {len(outline)}
-
-### Structure:
-"""]
-        for item in outline:
-            type_label = item['type'].upper()
-            lines.append(f"- [{type_label}] **{item['name']}** - line {item['line']}")
-
-        return "\n".join(lines)
-
-    # Default: return as JSON
-    return f"""## Result
-
-```json
-{json.dumps(result, indent=2)}
-```"""
+    return "\n".join(lines)
 
 
 def truncate_response(response: dict, max_size: int = MAX_RESPONSE_SIZE) -> dict:
@@ -1078,11 +932,7 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
 
     except Exception as e:
         logger.error(f"[MCP] Error: {e}", exc_info=True)
-        error = {
-            "code": -32603,
-            "message": str(e),
-            "data": {"retryable": True}
-        }
+        error = {"code": -32603, "message": str(e)}
 
     response = {"jsonrpc": "2.0"}
 
@@ -1146,7 +996,7 @@ async def capabilities():
         "transport": ["streamable-http"],
         "authentication": "none",
         "mcp_protocol_version": "2025-06-18",
-        "stateless": True,
+        "stateless": True,  # Important: Advertise stateless operation
         "annotations": {
             "readOnlyHint": True,
             "destructiveHint": False
@@ -1158,7 +1008,7 @@ async def capabilities():
 async def sse_stream(request: Request):
     """
     SSE streaming endpoint (OPTIONAL - for backwards compatibility).
-
+    
     NOTE: ChatGPT does NOT use this endpoint well. The POST /sse endpoint
     is preferred for stateless operation.
     """
@@ -1171,6 +1021,7 @@ async def sse_stream(request: Request):
 
     async def event_generator():
         try:
+            # Send the endpoint URL as the first event
             endpoint_url = f"{base_url}/messages?session_id={session_id}"
             yield f"event: endpoint\ndata: {endpoint_url}\n\n"
 
@@ -1182,6 +1033,7 @@ async def sse_stream(request: Request):
                     message = await asyncio.wait_for(message_queue.get(), timeout=15.0)
                     yield f"event: message\ndata: {json.dumps(message)}\n\n"
                 except asyncio.TimeoutError:
+                    # Heartbeat
                     yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
 
         except asyncio.CancelledError:
@@ -1204,7 +1056,7 @@ async def sse_stream(request: Request):
 async def mcp_messages(request: Request, session_id: str = Query(None)):
     """
     Receive MCP messages for SSE sessions.
-
+    
     IMPORTANT FIX: Now accepts requests even without valid session.
     This prevents tool eviction when sessions are lost.
     """
@@ -1215,22 +1067,25 @@ async def mcp_messages(request: Request, session_id: str = Query(None)):
     try:
         body = await request.json()
 
+        # Process request regardless of session state
         if isinstance(body, list):
             responses = []
             for req in body:
                 resp = await handle_mcp_request(req, base_url=base_url)
                 if resp is not None:
                     responses.append(resp)
-
+            
+            # If we have a valid SSE session, push to queue
             if session_id and session_id in sse_sessions:
                 for resp in responses:
                     await sse_sessions[session_id].put(resp)
                 return Response(status_code=202)
             else:
+                # Return directly (stateless mode)
                 return JSONResponse(content=responses)
         else:
             response = await handle_mcp_request(body, base_url=base_url)
-
+            
             if session_id and session_id in sse_sessions:
                 if response is not None:
                     await sse_sessions[session_id].put(response)
@@ -1243,7 +1098,7 @@ async def mcp_messages(request: Request, session_id: str = Query(None)):
     except json.JSONDecodeError as e:
         logger.error(f"[MSG] JSON parse error: {e}")
         return JSONResponse(
-            status_code=200,  # Return 200 to avoid tool eviction
+            status_code=400,
             content={
                 "jsonrpc": "2.0",
                 "error": {
@@ -1274,9 +1129,9 @@ async def mcp_messages(request: Request, session_id: str = Query(None)):
 async def mcp_endpoint(request: Request):
     """
     Direct MCP protocol endpoint (Streamable HTTP transport).
-
+    
     THIS IS THE PRIMARY ENDPOINT FOR CHATGPT.
-
+    
     Key design principles:
     1. STATELESS: No session validation required
     2. IDEMPOTENT: Same request always produces same response
@@ -1286,6 +1141,7 @@ async def mcp_endpoint(request: Request):
     client_host = request.client.host if request.client else "unknown"
     logger.info(f"[POST /sse] Request from {client_host}")
 
+    # Get session ID from request header (optional, for tracking only)
     session_id = request.headers.get("mcp-session-id")
     protocol_version = request.headers.get("mcp-protocol-version", "2025-06-18")
 
@@ -1295,12 +1151,14 @@ async def mcp_endpoint(request: Request):
         method = body.get("method", "") if isinstance(body, dict) else ""
         logger.info(f"[POST /sse] method={method}")
 
+        # Generate new session ID for initialize (tracking only)
         if method == "initialize":
             session_id = str(uuid.uuid4())
             if isinstance(body, dict) and "params" in body:
                 protocol_version = body["params"].get("protocolVersion", protocol_version)
             logger.info(f"[POST /sse] New session: {session_id[:8]}")
 
+        # Handle batch requests
         if isinstance(body, list):
             logger.info(f"[POST /sse] Processing batch of {len(body)} requests")
             responses = []
@@ -1319,6 +1177,7 @@ async def mcp_endpoint(request: Request):
 
             response = JSONResponse(content=mcp_response)
 
+        # Include session ID in response headers (optional tracking)
         if session_id:
             response.headers["Mcp-Session-Id"] = session_id
 
@@ -1327,7 +1186,7 @@ async def mcp_endpoint(request: Request):
     except json.JSONDecodeError as e:
         logger.error(f"[POST /sse] JSON parse error: {e}")
         return JSONResponse(
-            status_code=200,  # Return 200 to avoid tool eviction
+            status_code=400,
             content={
                 "jsonrpc": "2.0",
                 "error": {
