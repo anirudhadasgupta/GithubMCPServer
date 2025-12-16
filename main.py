@@ -399,7 +399,7 @@ async def search_code_impl(
     case_sensitive: bool = False,
     max_results: int = 20  # Reduced from 50 to prevent large responses
 ) -> dict:
-    """Search for code patterns using grep"""
+    """Search for code patterns using grep (Memory Safe Version)"""
     if not validate_repo_name(repo_name):
         return {"error": "Invalid repository name", "matches": []}
 
@@ -422,43 +422,66 @@ async def search_code_impl(
 
         grep_args.append(str(repo_path))
 
-        result = subprocess.run(
+        # Use Popen to stream output line-by-line (memory safe)
+        process = subprocess.Popen(
             grep_args,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=30,
             cwd=str(repo_path)
         )
 
-        for line in result.stdout.split('\n')[:max_results]:
-            if not line.strip():
-                continue
+        match_count = 0
 
-            # Parse grep output: filename:line_number:content
-            parts = line.split(':', 2)
-            if len(parts) >= 3:
-                file_path = parts[0].replace(str(repo_path) + '/', '')
-                try:
-                    line_num = int(parts[1])
-                    content = parts[2]
-                    matches.append({
-                        "file": file_path,
-                        "line": line_num,
-                        "content": content.strip()[:200]  # Reduced from 500 to prevent large responses
-                    })
-                except (ValueError, IndexError):
+        # Iterate over stdout as it is generated
+        try:
+            for line in process.stdout:
+                if not line.strip():
                     continue
+
+                # Parse grep output: filename:line_number:content
+                parts = line.split(':', 2)
+                if len(parts) >= 3:
+                    file_path = parts[0].replace(str(repo_path) + '/', '')
+                    try:
+                        line_num = int(parts[1])
+                        content = parts[2]
+
+                        matches.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "content": content.strip()[:200]  # Limit content length
+                        })
+                        match_count += 1
+
+                        # Stop reading if we have enough results
+                        if match_count >= max_results:
+                            process.terminate()
+                            break
+
+                    except (ValueError, IndexError):
+                        continue
+        finally:
+            # Clean up
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
 
         return {
             "success": True,
             "pattern": pattern,
             "matches": matches,
             "total_matches": len(matches),
-            "truncated": len(result.stdout.split('\n')) > max_results
+            "truncated": match_count >= max_results
         }
     except subprocess.TimeoutExpired:
         return {"error": "Search timed out", "matches": matches}
     except Exception as e:
+        logger.error(f"Search error: {e}")
         return {"error": str(e), "matches": []}
 
 
