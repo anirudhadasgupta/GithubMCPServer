@@ -409,8 +409,13 @@ async def search_code_impl(
     """
     Search for code patterns in a repository.
     
-    FIXED: Returns substantive response even when no matches found,
-    preventing tool eviction from sparse responses.
+    FIXED v3: Properly handles directory-prefixed file patterns like:
+    - "src/**/*.ts*" → searches in src/ directory for *.ts* files
+    - "*.py" → searches all directories for *.py files
+    - "components/*.jsx" → searches in components/ for *.jsx files
+    
+    The grep --include option only matches filenames, not paths.
+    Directory prefixes must be handled by adjusting the search path.
     """
     logger.info(f"[TOOL:search_code] repo={repo_name}, pattern={pattern}, file_pattern={file_pattern}")
 
@@ -436,13 +441,61 @@ async def search_code_impl(
             "repository": repo_name
         }
 
-    # Build grep command with proper argument ordering
-    cmd = ["grep", "-r", "-n", "--include", file_pattern or "*"]
+    # Parse file_pattern to extract directory prefix and filename glob
+    # Examples:
+    #   "src/**/*.ts*" → search_dir="src", filename_glob="*.ts*"
+    #   "*.py" → search_dir=None, filename_glob="*.py"
+    #   "components/*.jsx" → search_dir="components", filename_glob="*.jsx"
+    search_dir = None
+    filename_glob = "*"
+    original_pattern = file_pattern
+    
+    if file_pattern:
+        # Remove **/ recursive glob markers (grep -r handles recursion)
+        clean_pattern = file_pattern.replace("**/", "").replace("/**", "")
+        
+        if "/" in clean_pattern:
+            # Split on last slash to get directory and filename parts
+            parts = clean_pattern.rsplit("/", 1)
+            if len(parts) == 2:
+                dir_part, file_part = parts
+                # Only use directory if it doesn't contain wildcards
+                if "*" not in dir_part and "?" not in dir_part:
+                    search_dir = dir_part
+                    filename_glob = file_part if file_part else "*"
+                else:
+                    # Directory contains wildcards, just use filename part
+                    filename_glob = file_part if file_part else "*"
+            else:
+                filename_glob = clean_pattern
+        else:
+            filename_glob = clean_pattern
+    
+    # Determine the actual search path
+    if search_dir:
+        actual_search_path = repo_path / search_dir
+        if not actual_search_path.exists():
+            logger.warning(f"[TOOL:search_code] Directory '{search_dir}' not found, searching entire repo")
+            actual_search_path = repo_path
+            search_dir = None  # Reset for reporting
+    else:
+        actual_search_path = repo_path
+    
+    # Ensure filename_glob is valid for grep --include
+    if not filename_glob or filename_glob == "":
+        filename_glob = "*"
+    
+    logger.info(f"[TOOL:search_code] Parsed: search_dir={search_dir}, filename_glob={filename_glob}, search_path={actual_search_path}")
+
+    # Build grep command
+    cmd = ["grep", "-r", "-n", f"--include={filename_glob}"]
     if not case_sensitive:
         cmd.append("-i")
     cmd.append("--")  # End of options marker
     cmd.append(pattern)
-    cmd.append(str(repo_path))
+    cmd.append(str(actual_search_path))
+    
+    logger.debug(f"[TOOL:search_code] Command: {' '.join(cmd)}")
 
     try:
         result = subprocess.run(
@@ -458,6 +511,7 @@ async def search_code_impl(
                 if ":" in line:
                     parts = line.split(":", 2)
                     if len(parts) >= 3:
+                        # Make path relative to repo root
                         file_path = parts[0].replace(str(repo_path) + "/", "")
                         line_num = parts[1]
                         content = parts[2][:200].strip()
@@ -468,8 +522,12 @@ async def search_code_impl(
                         })
 
         total_in_output = len(result.stdout.split("\n")) if result.stdout else 0
+        
+        # Log grep stderr for debugging (e.g., permission errors)
+        if result.stderr:
+            logger.warning(f"[TOOL:search_code] grep stderr: {result.stderr[:500]}")
 
-        # CRITICAL: Always return complete, substantive response
+        # Build comprehensive response
         return {
             "matches": matches,
             "total": len(matches),
@@ -478,7 +536,9 @@ async def search_code_impl(
             "search_completed": True,
             "pattern": pattern,
             "repository": repo_name,
-            "file_filter": file_pattern or "*",
+            "file_filter": original_pattern or "*",
+            "effective_file_glob": filename_glob,
+            "search_directory": search_dir or "(entire repository)",
             "case_sensitive": case_sensitive
         }
 
@@ -757,11 +817,15 @@ def format_result_as_markdown(tool_name: str, result: dict) -> str:
         pattern = result.get("pattern", "unknown")
         repo = result.get("repository", "unknown")
         file_filter = result.get("file_filter", "*")
+        effective_glob = result.get("effective_file_glob", file_filter)
+        search_dir = result.get("search_directory", "(entire repository)")
         case_sensitive = result.get("case_sensitive", False)
         
         lines.append(f"**Pattern:** `{pattern}`")
         lines.append(f"**Repository:** `{repo}`")
-        lines.append(f"**File Filter:** `{file_filter}`")
+        lines.append(f"**Requested Filter:** `{file_filter}`")
+        lines.append(f"**Effective File Glob:** `{effective_glob}`")
+        lines.append(f"**Search Directory:** `{search_dir}`")
         lines.append(f"**Case Sensitive:** {case_sensitive}")
         lines.append(f"**Matches Found:** {len(matches)}")
         
@@ -780,18 +844,19 @@ def format_result_as_markdown(tool_name: str, result: dict) -> str:
         else:
             # CRITICAL FIX: Substantive message for no results
             lines.append("### Result: No Matches Found\n")
-            lines.append(f"The search for pattern `{pattern}` completed successfully but found no matches in repository `{repo}`.")
+            lines.append(f"The search for pattern `{pattern}` completed successfully but found no matches.")
+            lines.append("")
+            lines.append(f"**Search scope:** Files matching `{effective_glob}` in `{search_dir}`")
             lines.append("")
             lines.append("**Possible reasons:**")
-            lines.append("- The pattern does not exist in the codebase")
-            lines.append("- The pattern may use different casing (search is case-insensitive by default)")
-            lines.append("- The file filter may be excluding relevant files")
+            lines.append("- The pattern does not exist in the searched files")
+            lines.append("- The file filter may be too restrictive")
+            lines.append("- Try searching without a file filter to search all files")
             lines.append("")
             lines.append("**Suggestions:**")
-            lines.append("- Try a different or broader search pattern")
-            lines.append("- Adjust the file filter (e.g., use `*` for all files)")
-            lines.append("- Use `get_tree` to explore the repository structure")
-            lines.append("- Try searching for partial terms or common variations")
+            lines.append("- Use `get_tree` to verify the directory structure")
+            lines.append("- Try a simpler file filter like `*.ts` instead of `src/**/*.ts*`")
+            lines.append("- Search for partial terms or common variations")
 
     elif tool_name == "get_tree":
         tree_content = result.get("tree", "")
