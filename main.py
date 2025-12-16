@@ -1141,8 +1141,12 @@ async def sse_stream(request: Request):
     NOTE: ChatGPT does NOT use this endpoint well. The POST /sse endpoint
     is preferred for stateless operation.
     """
+    # Get real client IP (X-Forwarded-For for proxied requests, or direct client)
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    real_client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else ""
+    client_host = real_client_ip or (request.client.host if request.client else "unknown")
+
     # Generate deterministic session ID based on client info for stability
-    client_host = request.client.host if request.client else "unknown"
     base_url = get_base_url_from_request(request)
     client_fingerprint = f"{client_host}:{base_url}"
     session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, client_fingerprint))
@@ -1278,7 +1282,11 @@ async def mcp_endpoint(request: Request):
     4. EXPLICIT: Always returns structured JSON, never silence
     5. STABLE: Consistent response headers to maintain connection identity
     """
-    client_host = request.client.host if request.client else "unknown"
+    # Get real client IP (X-Forwarded-For for proxied requests, or direct client)
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    real_client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else ""
+    client_host = real_client_ip or (request.client.host if request.client else "unknown")
+
     request_id = str(uuid.uuid4())[:8]  # Short ID for log correlation
     logger.info(f"[POST /sse] [{request_id}] Request from {client_host}")
 
