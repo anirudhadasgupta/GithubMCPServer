@@ -1019,10 +1019,19 @@ async def mcp_endpoint(request: Request):
         body = await request.json()
 
         # Extract base URL from request for constructing download links
-        # Use X-Forwarded-Proto/Host headers if behind a proxy, otherwise use request URL
-        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-        host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
-        base_url = f"{scheme}://{host}"
+        # Priority: 1) X-Forwarded headers (Railway/proxy), 2) Host header, 3) BASE_URL env var
+        scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+
+        # If host contains 0.0.0.0 or is empty, try BASE_URL env var (if it's a real URL)
+        if not host or "0.0.0.0" in host:
+            if BASE_URL and "0.0.0.0" not in BASE_URL:
+                base_url = BASE_URL.rstrip("/")
+            else:
+                # Last resort - use request URL but this likely won't work externally
+                base_url = f"{scheme}://{request.url.netloc}"
+        else:
+            base_url = f"{scheme}://{host}"
 
         # Handle batch requests
         if isinstance(body, list):
