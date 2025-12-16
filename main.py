@@ -244,10 +244,21 @@ def validate_file_path(repo_path: Path, file_path: str) -> Optional[Path]:
     """Validate file path to prevent path traversal attacks"""
     try:
         full_path = (repo_path / file_path).resolve()
-        if repo_path.resolve() in full_path.parents or full_path == repo_path.resolve():
+        resolved_repo = repo_path.resolve()
+
+        # Reject if trying to access the repo directory itself (not a file)
+        if full_path == resolved_repo:
             return None
-        if not str(full_path).startswith(str(repo_path.resolve())):
+
+        # Check that the file is inside the repo directory
+        # The repo path must be a parent of the full path
+        if resolved_repo not in full_path.parents:
             return None
+
+        # Additional safety check: path string must start with repo path
+        if not str(full_path).startswith(str(resolved_repo)):
+            return None
+
         return full_path
     except (ValueError, RuntimeError):
         return None
