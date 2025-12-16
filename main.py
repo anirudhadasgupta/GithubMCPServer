@@ -935,12 +935,20 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
     result = None
     error = None
 
+    # Server's actual supported protocol version
+    SERVER_PROTOCOL_VERSION = "2024-11-05"
+    
     try:
         if method == "initialize":
-            client_protocol = params.get("protocolVersion", "2025-06-18")
-            logger.info(f"[MCP] Client protocol: {client_protocol}")
+            client_protocol = params.get("protocolVersion", "2024-11-05")
+            logger.info(f"[MCP] Client requested protocol: {client_protocol}")
+            
+            # Return the server's supported version, not the client's requested version
+            # This is correct MCP protocol negotiation behavior
+            logger.info(f"[MCP] Server responding with protocol: {SERVER_PROTOCOL_VERSION}")
+            
             result = {
-                "protocolVersion": client_protocol,
+                "protocolVersion": SERVER_PROTOCOL_VERSION,
                 "serverInfo": {
                     "name": SERVER_INFO["name"],
                     "version": SERVER_INFO["version"],
@@ -950,7 +958,7 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
                 },
                 "capabilities": {
                     "tools": {"listChanged": False},
-                    "resources": {"listChanged": False}
+                    "resources": {"subscribe": False, "listChanged": False}
                 }
             }
 
@@ -984,7 +992,49 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
                 }
 
         elif method == "resources/list":
+            logger.info("[MCP] Listing resources")
             result = {"resources": RESOURCES, "nextCursor": None}
+
+        elif method == "resources/read":
+            resource_uri = params.get("uri", "")
+            logger.info(f"[MCP] Reading resource: {resource_uri}")
+            
+            # Parse the resource URI to extract repo name
+            # Expected format: repo://anirudhadasgupta/{repo_name}
+            if resource_uri.startswith(f"repo://{ALLOWED_USERNAME}/"):
+                repo_name = resource_uri.replace(f"repo://{ALLOWED_USERNAME}/", "")
+                repo_path = get_repo_path(repo_name)
+                
+                if repo_path.exists():
+                    result = {
+                        "contents": [
+                            {
+                                "uri": resource_uri,
+                                "mimeType": "application/x-directory",
+                                "text": f"Repository '{repo_name}' is available. Use tools to explore:\n- get_tree: View directory structure\n- read_file: Read file contents\n- search_code: Search for patterns\n- get_outline: Get code structure"
+                            }
+                        ]
+                    }
+                else:
+                    result = {
+                        "contents": [
+                            {
+                                "uri": resource_uri,
+                                "mimeType": "text/plain",
+                                "text": f"Repository '{repo_name}' is not cloned. Call clone_repository first."
+                            }
+                        ]
+                    }
+            else:
+                result = {
+                    "contents": [
+                        {
+                            "uri": resource_uri,
+                            "mimeType": "text/plain",
+                            "text": f"Unknown resource URI format. Expected: repo://{ALLOWED_USERNAME}/{{repo_name}}"
+                        }
+                    ]
+                }
 
         elif method == "ping":
             result = {}
@@ -1060,8 +1110,8 @@ async def capabilities():
         "resources": True,
         "transport": ["streamable-http"],
         "authentication": "none",
-        "mcp_protocol_version": "2025-06-18",
-        "stateless": True,  # Important: Advertise stateless operation
+        "mcp_protocol_version": "2024-11-05",
+        "stateless": True,
         "annotations": {
             "readOnlyHint": True,
             "destructiveHint": False
@@ -1202,45 +1252,56 @@ async def mcp_endpoint(request: Request):
     2. IDEMPOTENT: Same request always produces same response
     3. TOLERANT: Never returns 404 or session errors
     4. EXPLICIT: Always returns structured JSON, never silence
+    5. STABLE: Consistent response headers to maintain connection identity
     """
     client_host = request.client.host if request.client else "unknown"
-    logger.info(f"[POST /sse] Request from {client_host}")
+    request_id = str(uuid.uuid4())[:8]  # Short ID for log correlation
+    logger.info(f"[POST /sse] [{request_id}] Request from {client_host}")
 
     # Get session ID from request header (optional, for tracking only)
     session_id = request.headers.get("mcp-session-id")
-    protocol_version = request.headers.get("mcp-protocol-version", "2025-06-18")
+    
+    # Standard headers for all responses to maintain connection stability
+    stability_headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Connection": "keep-alive",
+        "Keep-Alive": "timeout=300, max=1000",
+        "X-MCP-Server-Version": "1.0.0",
+        "X-MCP-Protocol-Version": "2024-11-05",
+        "X-Request-Id": request_id,
+    }
 
     try:
         body = await request.json()
         base_url = get_base_url_from_request(request)
         method = body.get("method", "") if isinstance(body, dict) else ""
-        logger.info(f"[POST /sse] method={method}")
+        logger.info(f"[POST /sse] [{request_id}] method={method}")
 
         # Generate new session ID for initialize (tracking only)
         if method == "initialize":
             session_id = str(uuid.uuid4())
-            if isinstance(body, dict) and "params" in body:
-                protocol_version = body["params"].get("protocolVersion", protocol_version)
-            logger.info(f"[POST /sse] New session: {session_id[:8]}")
+            logger.info(f"[POST /sse] [{request_id}] New session: {session_id[:8]}")
 
         # Handle batch requests
         if isinstance(body, list):
-            logger.info(f"[POST /sse] Processing batch of {len(body)} requests")
+            logger.info(f"[POST /sse] [{request_id}] Processing batch of {len(body)} requests")
             responses = []
             for req in body:
                 resp = await handle_mcp_request(req, base_url=base_url)
                 if resp is not None:
                     responses.append(resp)
-            response = JSONResponse(content=responses)
+            response = JSONResponse(content=responses, headers=stability_headers)
         else:
             mcp_response = await handle_mcp_request(body, base_url=base_url)
             if mcp_response is None:
-                resp = Response(status_code=204)
+                resp = Response(status_code=204, headers=stability_headers)
                 if session_id:
                     resp.headers["Mcp-Session-Id"] = session_id
                 return resp
 
-            response = JSONResponse(content=mcp_response)
+            response = JSONResponse(content=mcp_response, headers=stability_headers)
 
         # Include session ID in response headers (optional tracking)
         if session_id:
@@ -1249,9 +1310,10 @@ async def mcp_endpoint(request: Request):
         return response
 
     except json.JSONDecodeError as e:
-        logger.error(f"[POST /sse] JSON parse error: {e}")
+        logger.error(f"[POST /sse] [{request_id}] JSON parse error: {e}")
         return JSONResponse(
             status_code=400,
+            headers=stability_headers,
             content={
                 "jsonrpc": "2.0",
                 "error": {
@@ -1263,11 +1325,12 @@ async def mcp_endpoint(request: Request):
             }
         )
     except Exception as e:
-        logger.error(f"[POST /sse] Error: {e}", exc_info=True)
+        logger.error(f"[POST /sse] [{request_id}] Error: {e}", exc_info=True)
         # CRITICAL: Return 200 with error in body, not 500
         # This prevents ChatGPT from marking the tool as unhealthy
         return JSONResponse(
             status_code=200,
+            headers=stability_headers,
             content={
                 "jsonrpc": "2.0",
                 "error": {
@@ -1289,16 +1352,17 @@ async def root():
     return {
         "name": "GitHub Search MCP Server",
         "version": "1.0.0",
+        "protocol_version": "2024-11-05",
         "transport": "streamable-http",
         "stateless": True,
         "endpoints": {
             "mcp": "/sse (POST for MCP requests - PRIMARY)",
-            "sse_legacy": "/sse (GET for SSE stream - OPTIONAL)",
-            "messages_legacy": "/messages?session_id=<id> (POST - OPTIONAL)",
+            "sse_legacy": "/sse (GET for SSE stream - DEPRECATED)",
+            "messages_legacy": "/messages?session_id=<id> (POST - DEPRECATED)",
             "health": "/health",
             "capabilities": "/capabilities"
         },
-        "documentation": "https://modelcontextprotocol.io/specification/2025-06-18"
+        "documentation": "https://modelcontextprotocol.io/specification/2024-11-05"
     }
 
 
