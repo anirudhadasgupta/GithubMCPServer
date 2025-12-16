@@ -698,7 +698,8 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
 async def archive_repository_impl(
     repo_name: str,
     include_hidden: bool = False,
-    path: str = ""
+    path: str = "",
+    base_url: str = ""
 ) -> dict:
     """
     Generate a download URL for a repository archive as a ZIP file.
@@ -753,7 +754,9 @@ async def archive_repository_impl(
             file_count += 1
 
     # Build download URL with query parameters
-    download_url = f"{BASE_URL}/download/{repo_name}"
+    # Use provided base_url (from request) or fall back to configured BASE_URL
+    effective_base_url = base_url or BASE_URL
+    download_url = f"{effective_base_url}/download/{repo_name}"
     query_params = []
     if include_hidden:
         query_params.append("include_hidden=true")
@@ -778,7 +781,7 @@ async def archive_repository_impl(
 # MCP Protocol Handler
 # ============================================================================
 
-async def handle_mcp_request(request_data: dict) -> dict:
+async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
     """Handle MCP JSON-RPC requests"""
     method = request_data.get("method", "")
     params = request_data.get("params", {})
@@ -822,7 +825,7 @@ async def handle_mcp_request(request_data: dict) -> dict:
             elif tool_name == "get_outline":
                 tool_result = await get_outline_impl(**tool_args)
             elif tool_name == "archive_repository":
-                tool_result = await archive_repository_impl(**tool_args)
+                tool_result = await archive_repository_impl(**tool_args, base_url=base_url)
             else:
                 error = {
                     "code": -32601,
@@ -1009,23 +1012,38 @@ async def download_repository(
     )
 
 
-@app.post("/mcp")
+@app.post("/sse")
 async def mcp_endpoint(request: Request):
     """Main MCP protocol endpoint (Streamable HTTP transport)"""
     try:
         body = await request.json()
 
+        # Extract base URL from request for constructing download links
+        # Priority: 1) X-Forwarded headers (Railway/proxy), 2) Host header, 3) BASE_URL env var
+        scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+
+        # If host contains 0.0.0.0 or is empty, try BASE_URL env var (if it's a real URL)
+        if not host or "0.0.0.0" in host:
+            if BASE_URL and "0.0.0.0" not in BASE_URL:
+                base_url = BASE_URL.rstrip("/")
+            else:
+                # Last resort - use request URL but this likely won't work externally
+                base_url = f"{scheme}://{request.url.netloc}"
+        else:
+            base_url = f"{scheme}://{host}"
+
         # Handle batch requests
         if isinstance(body, list):
             responses = []
             for req in body:
-                resp = await handle_mcp_request(req)
+                resp = await handle_mcp_request(req, base_url=base_url)
                 if resp is not None:
                     responses.append(resp)
             return JSONResponse(content=responses)
 
         # Handle single request
-        response = await handle_mcp_request(body)
+        response = await handle_mcp_request(body, base_url=base_url)
         if response is None:
             return Response(status_code=204)
 
@@ -1064,7 +1082,7 @@ async def root():
         "name": "GitHub Search MCP Server",
         "version": "1.0.0",
         "endpoints": {
-            "mcp": "/mcp",
+            "sse": "/sse",
             "health": "/health",
             "capabilities": "/capabilities",
             "download": "/download/{repo_name}"
