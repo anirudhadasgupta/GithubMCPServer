@@ -550,6 +550,14 @@ async def get_tree_impl(
         logger.warning(f"[TOOL:get_tree] Repo not found: {repo_path}")
         return {"error": f"Repository '{repo_name}' not cloned. Use clone_repository first.", "tree": ""}
 
+    # Fix common mistake: strip repo name from path if user included it
+    if path.startswith(repo_name + "/"):
+        path = path[len(repo_name) + 1:]
+        logger.debug(f"[TOOL:get_tree] Stripped repo name from path, now: {path}")
+    elif path == repo_name:
+        path = "."
+        logger.debug(f"[TOOL:get_tree] Path was repo name, using root")
+
     target_path = validate_file_path(repo_path, path)
     if target_path is None:
         logger.debug(f"[TOOL:get_tree] Invalid path, using repo root")
@@ -636,6 +644,11 @@ async def read_file_impl(
         logger.warning(f"[TOOL:read_file] Repo not found: {repo_path}")
         return {"error": f"Repository '{repo_name}' not cloned. Use clone_repository first.", "content": ""}
 
+    # Fix common mistake: strip repo name from file_path if user included it
+    if file_path.startswith(repo_name + "/"):
+        file_path = file_path[len(repo_name) + 1:]
+        logger.debug(f"[TOOL:read_file] Stripped repo name from path, now: {file_path}")
+
     full_path = validate_file_path(repo_path, file_path)
     if full_path is None:
         logger.warning(f"[TOOL:read_file] Invalid file path: {file_path}")
@@ -714,6 +727,11 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
     if not validate_repo_name(repo_name):
         logger.warning(f"[TOOL:get_outline] Invalid repo name: {repo_name}")
         return {"error": "Invalid repository name", "outline": []}
+
+    # Fix common mistake: strip repo name from file_path if user included it
+    if file_path.startswith(repo_name + "/"):
+        file_path = file_path[len(repo_name) + 1:]
+        logger.debug(f"[TOOL:get_outline] Stripped repo name from path, now: {file_path}")
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
