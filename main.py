@@ -14,6 +14,9 @@ import json
 import shutil
 import asyncio
 import subprocess
+import base64
+import zipfile
+import io
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Any
@@ -206,6 +209,37 @@ TOOLS = [
                 }
             },
             "required": ["repo_name", "file_path"]
+        },
+        "annotations": {
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False
+        }
+    },
+    {
+        "name": "archive_repository",
+        "title": "Archive Repository",
+        "description": "Archive a cloned repository as a ZIP file and return it as base64-encoded content. This allows downloading the entire repository for local analysis. The .git directory is excluded to reduce size.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo_name": {
+                    "type": "string",
+                    "description": "Name of the repository to archive"
+                },
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Whether to include hidden files (starting with .) except .git",
+                    "default": False
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional subdirectory path to archive (defaults to entire repo)",
+                    "default": ""
+                }
+            },
+            "required": ["repo_name"]
         },
         "annotations": {
             "readOnlyHint": True,
@@ -661,6 +695,114 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
         return {"error": str(e), "outline": []}
 
 
+async def archive_repository_impl(
+    repo_name: str,
+    include_hidden: bool = False,
+    path: str = ""
+) -> dict:
+    """
+    Archive a repository as a ZIP file and return as base64-encoded content.
+
+    This tool creates an in-memory ZIP archive of the repository (or a subdirectory)
+    and returns it as base64-encoded data. The .git directory is always excluded.
+
+    The response includes:
+    - zip_base64: Base64-encoded ZIP file content
+    - filename: Suggested filename for the archive
+    - size_bytes: Size of the ZIP file in bytes
+    - file_count: Number of files included in the archive
+
+    ChatGPT can use this to download and unpack the repository in its container.
+    """
+    if not validate_repo_name(repo_name):
+        return {"error": "Invalid repository name", "success": False}
+
+    repo_path = get_repo_path(repo_name)
+    if not repo_path.exists():
+        return {
+            "error": f"Repository '{repo_name}' not cloned. Use clone_repository first.",
+            "success": False
+        }
+
+    # Determine the target path to archive
+    if path:
+        target_path = validate_file_path(repo_path, path)
+        if target_path is None:
+            return {"error": "Invalid path specified", "success": False}
+        if not target_path.exists():
+            return {"error": f"Path '{path}' does not exist", "success": False}
+        if not target_path.is_dir():
+            return {"error": f"Path '{path}' is not a directory", "success": False}
+        archive_name = f"{repo_name}_{target_path.name}"
+    else:
+        target_path = repo_path
+        archive_name = repo_name
+
+    try:
+        # Create in-memory ZIP file
+        zip_buffer = io.BytesIO()
+        file_count = 0
+        max_archive_size = 50 * 1024 * 1024  # 50MB limit
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in target_path.rglob('*'):
+                # Skip .git directory
+                if '.git' in file_path.parts:
+                    continue
+
+                # Skip hidden files if not included
+                if not include_hidden:
+                    # Check if any part of the path (except the target) starts with .
+                    relative_parts = file_path.relative_to(target_path).parts
+                    if any(part.startswith('.') for part in relative_parts):
+                        continue
+
+                # Only add files, not directories
+                if file_path.is_file():
+                    # Calculate relative path for the archive
+                    arcname = str(file_path.relative_to(target_path))
+
+                    # Check file size before adding
+                    try:
+                        file_size = file_path.stat().st_size
+                        if file_size > 10 * 1024 * 1024:  # Skip files larger than 10MB
+                            continue
+
+                        zip_file.write(file_path, arcname)
+                        file_count += 1
+
+                        # Check if we're exceeding the archive size limit
+                        if zip_buffer.tell() > max_archive_size:
+                            return {
+                                "error": f"Archive would exceed {max_archive_size // (1024*1024)}MB limit. Try archiving a subdirectory using the 'path' parameter.",
+                                "success": False
+                            }
+                    except (PermissionError, OSError):
+                        continue
+
+        # Get the ZIP content
+        zip_content = zip_buffer.getvalue()
+        zip_size = len(zip_content)
+
+        # Encode as base64
+        zip_base64 = base64.b64encode(zip_content).decode('utf-8')
+
+        return {
+            "success": True,
+            "repo_name": repo_name,
+            "path": path if path else "/",
+            "filename": f"{archive_name}.zip",
+            "zip_base64": zip_base64,
+            "size_bytes": zip_size,
+            "file_count": file_count,
+            "include_hidden": include_hidden,
+            "instructions": "Decode the base64 content and save as a ZIP file. Extract using: unzip <filename>.zip"
+        }
+
+    except Exception as e:
+        return {"error": str(e), "success": False}
+
+
 # ============================================================================
 # MCP Protocol Handler
 # ============================================================================
@@ -708,6 +850,8 @@ async def handle_mcp_request(request_data: dict) -> dict:
                 tool_result = await read_file_impl(**tool_args)
             elif tool_name == "get_outline":
                 tool_result = await get_outline_impl(**tool_args)
+            elif tool_name == "archive_repository":
+                tool_result = await archive_repository_impl(**tool_args)
             else:
                 error = {
                     "code": -32601,
