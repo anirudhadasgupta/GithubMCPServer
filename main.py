@@ -1142,6 +1142,7 @@ async def sse_stream(request: Request):
 
             while True:
                 if await request.is_disconnected():
+                    logger.info(f"[SSE] Client disconnected, session_id={session_id[:8]}")
                     break
 
                 try:
@@ -1149,11 +1150,13 @@ async def sse_stream(request: Request):
                     yield f"event: message\ndata: {json.dumps(message)}\n\n"
                 except asyncio.TimeoutError:
                     # Heartbeat every 30s to prevent load balancer idle timeout
+                    logger.debug(f"[SSE] Sending heartbeat ping, session_id={session_id[:8]}")
                     yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
 
         except asyncio.CancelledError:
-            pass
+            logger.info(f"[SSE] Connection cancelled, session_id={session_id[:8]}")
         finally:
+            logger.info(f"[SSE] Cleaning up session, session_id={session_id[:8]}")
             sse_sessions.pop(session_id, None)
 
     return StreamingResponse(
