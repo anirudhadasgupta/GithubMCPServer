@@ -1141,20 +1141,15 @@ async def sse_stream(request: Request):
     NOTE: ChatGPT does NOT use this endpoint well. The POST /sse endpoint
     is preferred for stateless operation.
     """
-    # Get real client IP (X-Forwarded-For for proxied requests, or direct client)
-    forwarded_for = request.headers.get("x-forwarded-for", "")
-    real_client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else ""
-    client_host = real_client_ip or (request.client.host if request.client else "unknown")
-
-    # Generate deterministic session ID based on client info for stability
+    # Generate deterministic session ID based on server URL only (not client IP)
+    # This ensures all clients get the same session ID for this stateless server
     base_url = get_base_url_from_request(request)
-    client_fingerprint = f"{client_host}:{base_url}"
-    session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, client_fingerprint))
+    session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, base_url))
 
     message_queue: asyncio.Queue = asyncio.Queue()
     sse_sessions[session_id] = message_queue
 
-    logger.info(f"[SSE] Connection, session_id={session_id[:8]} (client: {client_host})")
+    logger.info(f"[SSE] Connection, session_id={session_id[:8]} (fixed for server)")
 
     async def event_generator():
         try:
@@ -1317,14 +1312,14 @@ async def mcp_endpoint(request: Request):
 
         # Session ID handling for initialize
         # CRITICAL: Use stable session ID to prevent URI rotation issues with ChatGPT
+        # Since this server is stateless, use a fixed session ID based only on server URL
+        # (not client IP, since OpenAI uses multiple IPs: 20.169.78.67, 20.169.78.70, etc.)
         if method == "initialize":
             # If client provided a session ID, keep using it (re-initialization)
             if not session_id:
-                # Generate deterministic session ID based on client info for stability
-                # This ensures the same client gets the same session across reconnects
-                client_fingerprint = f"{client_host}:{base_url}"
-                session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, client_fingerprint))
-            logger.info(f"[POST /sse] [{request_id}] Session: {session_id[:8]} (client: {client_host})")
+                # Generate deterministic session ID based on server URL only
+                session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, base_url))
+            logger.info(f"[POST /sse] [{request_id}] Session: {session_id[:8]} (fixed for server)")
 
         # Handle batch requests
         if isinstance(body, list):
