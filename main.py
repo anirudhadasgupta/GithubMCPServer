@@ -807,7 +807,7 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
 
         # List tools
         elif method == "tools/list":
-            result = {"tools": TOOLS}
+            result = {"tools": TOOLS, "nextCursor": None}
 
         # Call tool
         elif method == "tools/call":
@@ -847,7 +847,7 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
 
         # List resources
         elif method == "resources/list":
-            result = {"resources": RESOURCES}
+            result = {"resources": RESOURCES, "nextCursor": None}
 
         # Ping
         elif method == "ping":
