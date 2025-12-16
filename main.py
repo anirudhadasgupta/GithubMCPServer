@@ -49,6 +49,10 @@ BASE_URL = os.getenv("BASE_URL", f"http://{HOST}:{PORT}")
 
 logger.info(f"Starting MCP server with BASE_URL={BASE_URL}, HOST={HOST}, PORT={PORT}")
 
+# Response size limit (ChatGPT has ~100KB limit for action responses)
+MAX_RESPONSE_SIZE = int(os.getenv("MAX_RESPONSE_SIZE", "50000"))  # 50KB default
+logger.info(f"MAX_RESPONSE_SIZE={MAX_RESPONSE_SIZE}")
+
 # Session management for SSE connections
 # Maps session_id -> asyncio.Queue for sending responses
 sse_sessions: dict[str, asyncio.Queue] = {}
@@ -393,7 +397,7 @@ async def search_code_impl(
     pattern: str,
     file_pattern: Optional[str] = None,
     case_sensitive: bool = False,
-    max_results: int = 50
+    max_results: int = 20  # Reduced from 50 to prevent large responses
 ) -> dict:
     """Search for code patterns using grep"""
     if not validate_repo_name(repo_name):
@@ -440,7 +444,7 @@ async def search_code_impl(
                     matches.append({
                         "file": file_path,
                         "line": line_num,
-                        "content": content.strip()[:500]  # Limit content length
+                        "content": content.strip()[:200]  # Reduced from 500 to prevent large responses
                     })
                 except (ValueError, IndexError):
                     continue
@@ -559,18 +563,23 @@ async def read_file_impl(
 
         total_lines = len(lines)
 
-        # Handle line ranges
+        # Handle line ranges - limit to 200 lines max to prevent large responses
+        MAX_LINES = 200
         start_idx = max(0, start_line - 1)
-        end_idx = total_lines if end_line <= 0 else min(end_line, total_lines)
+        if end_line <= 0:
+            end_idx = min(start_idx + MAX_LINES, total_lines)
+        else:
+            end_idx = min(end_line, start_idx + MAX_LINES, total_lines)
 
         selected_lines = lines[start_idx:end_idx]
+        was_truncated = (end_line <= 0 and total_lines > end_idx) or (end_line > 0 and end_line > end_idx)
 
         # Add line numbers
         numbered_content = []
         for i, line in enumerate(selected_lines, start=start_idx + 1):
             numbered_content.append(f"{i:4d} | {line.rstrip()}")
 
-        return {
+        result = {
             "success": True,
             "repo_name": repo_name,
             "file_path": file_path,
@@ -580,6 +589,10 @@ async def read_file_impl(
             "end_line": end_idx,
             "file_size": file_size
         }
+        if was_truncated:
+            result["truncated"] = True
+            result["note"] = f"Output limited to {MAX_LINES} lines. Use start_line/end_line to read other sections."
+        return result
     except UnicodeDecodeError:
         return {"error": "Cannot read binary file", "content": ""}
     except Exception as e:
@@ -797,6 +810,35 @@ async def archive_repository_impl(
 # MCP Protocol Handler
 # ============================================================================
 
+def truncate_response(response: dict, max_size: int = MAX_RESPONSE_SIZE) -> dict:
+    """Truncate response if it exceeds max size to prevent connection issues."""
+    response_str = json.dumps(response)
+    original_size = len(response_str)
+
+    if original_size <= max_size:
+        return response
+
+    logger.warning(f"[TRUNCATE] Response too large: {original_size} bytes, truncating to {max_size}")
+
+    # Try to truncate the content inside the response
+    if "result" in response and "content" in response["result"]:
+        content = response["result"]["content"]
+        if isinstance(content, list):
+            for item in content:
+                if item.get("type") == "text" and "text" in item:
+                    text = item["text"]
+                    # Calculate how much we need to trim
+                    overhead = original_size - len(text)
+                    max_text_size = max_size - overhead - 200  # Leave room for truncation message
+
+                    if len(text) > max_text_size:
+                        truncated_text = text[:max_text_size]
+                        item["text"] = truncated_text + f"\n\n... [TRUNCATED: Response was {original_size} bytes, limit is {max_size} bytes. Use more specific queries or smaller file ranges.]"
+                        logger.info(f"[TRUNCATE] Truncated text from {len(text)} to {len(item['text'])} chars")
+
+    return response
+
+
 async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
     """Handle MCP JSON-RPC requests"""
     method = request_data.get("method", "")
@@ -898,6 +940,12 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
         response["error"] = error
     else:
         response["result"] = result
+
+    # Truncate if response is too large
+    response = truncate_response(response)
+
+    response_size = len(json.dumps(response))
+    logger.info(f"[MCP] Response size: {response_size} bytes")
 
     return response
 
