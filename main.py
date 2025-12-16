@@ -14,15 +14,14 @@ import json
 import shutil
 import asyncio
 import subprocess
-import base64
 import zipfile
 import io
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Any
 
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Response, Query
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -36,6 +35,7 @@ REPO_STORAGE_PATH = Path(os.getenv("REPO_STORAGE_PATH", "/tmp/repos"))
 ALLOWED_USERNAME = os.getenv("ALLOWED_USERNAME", "anirudhadasgupta")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
+BASE_URL = os.getenv("BASE_URL", f"http://{HOST}:{PORT}")
 
 # Ensure storage path exists
 REPO_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
@@ -220,7 +220,7 @@ TOOLS = [
     {
         "name": "archive_repository",
         "title": "Archive Repository",
-        "description": "Archive a cloned repository as a ZIP file and return it as base64-encoded content. This allows downloading the entire repository for local analysis. The .git directory is excluded to reduce size.",
+        "description": "Get a download link for a cloned repository as a ZIP file. Returns a URL that can be used to download the entire repository (or a subdirectory) for local analysis. The .git directory is excluded to reduce size. ChatGPT can use this URL to download and extract the repository.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -701,18 +701,18 @@ async def archive_repository_impl(
     path: str = ""
 ) -> dict:
     """
-    Archive a repository as a ZIP file and return as base64-encoded content.
+    Generate a download URL for a repository archive as a ZIP file.
 
-    This tool creates an in-memory ZIP archive of the repository (or a subdirectory)
-    and returns it as base64-encoded data. The .git directory is always excluded.
+    This tool validates the repository exists and returns a download URL.
+    The actual ZIP file is generated when the download URL is accessed.
+    The .git directory is always excluded from the archive.
 
     The response includes:
-    - zip_base64: Base64-encoded ZIP file content
+    - download_url: URL to download the ZIP file
     - filename: Suggested filename for the archive
-    - size_bytes: Size of the ZIP file in bytes
-    - file_count: Number of files included in the archive
+    - file_count: Estimated number of files in the archive
 
-    ChatGPT can use this to download and unpack the repository in its container.
+    ChatGPT can use the download_url to fetch and extract the repository.
     """
     if not validate_repo_name(repo_name):
         return {"error": "Invalid repository name", "success": False}
@@ -738,69 +738,40 @@ async def archive_repository_impl(
         target_path = repo_path
         archive_name = repo_name
 
-    try:
-        # Create in-memory ZIP file
-        zip_buffer = io.BytesIO()
-        file_count = 0
-        max_archive_size = 50 * 1024 * 1024  # 50MB limit
+    # Count files to give an estimate
+    file_count = 0
+    for file_path in target_path.rglob('*'):
+        # Skip .git directory
+        if '.git' in file_path.parts:
+            continue
+        # Skip hidden files if not included
+        if not include_hidden:
+            relative_parts = file_path.relative_to(target_path).parts
+            if any(part.startswith('.') for part in relative_parts):
+                continue
+        if file_path.is_file():
+            file_count += 1
 
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for file_path in target_path.rglob('*'):
-                # Skip .git directory
-                if '.git' in file_path.parts:
-                    continue
+    # Build download URL with query parameters
+    download_url = f"{BASE_URL}/download/{repo_name}"
+    query_params = []
+    if include_hidden:
+        query_params.append("include_hidden=true")
+    if path:
+        query_params.append(f"path={path}")
+    if query_params:
+        download_url += "?" + "&".join(query_params)
 
-                # Skip hidden files if not included
-                if not include_hidden:
-                    # Check if any part of the path (except the target) starts with .
-                    relative_parts = file_path.relative_to(target_path).parts
-                    if any(part.startswith('.') for part in relative_parts):
-                        continue
-
-                # Only add files, not directories
-                if file_path.is_file():
-                    # Calculate relative path for the archive
-                    arcname = str(file_path.relative_to(target_path))
-
-                    # Check file size before adding
-                    try:
-                        file_size = file_path.stat().st_size
-                        if file_size > 10 * 1024 * 1024:  # Skip files larger than 10MB
-                            continue
-
-                        zip_file.write(file_path, arcname)
-                        file_count += 1
-
-                        # Check if we're exceeding the archive size limit
-                        if zip_buffer.tell() > max_archive_size:
-                            return {
-                                "error": f"Archive would exceed {max_archive_size // (1024*1024)}MB limit. Try archiving a subdirectory using the 'path' parameter.",
-                                "success": False
-                            }
-                    except (PermissionError, OSError):
-                        continue
-
-        # Get the ZIP content
-        zip_content = zip_buffer.getvalue()
-        zip_size = len(zip_content)
-
-        # Encode as base64
-        zip_base64 = base64.b64encode(zip_content).decode('utf-8')
-
-        return {
-            "success": True,
-            "repo_name": repo_name,
-            "path": path if path else "/",
-            "filename": f"{archive_name}.zip",
-            "zip_base64": zip_base64,
-            "size_bytes": zip_size,
-            "file_count": file_count,
-            "include_hidden": include_hidden,
-            "instructions": "Decode the base64 content and save as a ZIP file. Extract using: unzip <filename>.zip"
-        }
-
-    except Exception as e:
-        return {"error": str(e), "success": False}
+    return {
+        "success": True,
+        "repo_name": repo_name,
+        "path": path if path else "/",
+        "filename": f"{archive_name}.zip",
+        "download_url": download_url,
+        "file_count": file_count,
+        "include_hidden": include_hidden,
+        "instructions": f"Download the ZIP file from the URL above. ChatGPT can use: curl -o {archive_name}.zip '{download_url}' && unzip {archive_name}.zip"
+    }
 
 
 # ============================================================================
@@ -944,6 +915,100 @@ async def capabilities():
     }
 
 
+@app.get("/download/{repo_name}")
+async def download_repository(
+    repo_name: str,
+    include_hidden: bool = Query(default=False, description="Include hidden files"),
+    path: str = Query(default="", description="Subdirectory path to archive")
+):
+    """
+    Download a repository as a ZIP file.
+
+    This endpoint generates and streams a ZIP archive of the specified repository.
+    The .git directory is always excluded.
+    """
+    if not validate_repo_name(repo_name):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid repository name"}
+        )
+
+    repo_path = get_repo_path(repo_name)
+    if not repo_path.exists():
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Repository '{repo_name}' not found. Clone it first using the clone_repository tool."}
+        )
+
+    # Determine the target path to archive
+    if path:
+        target_path = validate_file_path(repo_path, path)
+        if target_path is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid path specified"}
+            )
+        if not target_path.exists():
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Path '{path}' does not exist"}
+            )
+        if not target_path.is_dir():
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Path '{path}' is not a directory"}
+            )
+        archive_name = f"{repo_name}_{target_path.name}"
+    else:
+        target_path = repo_path
+        archive_name = repo_name
+
+    def generate_zip():
+        """Generator that yields ZIP file chunks"""
+        zip_buffer = io.BytesIO()
+        max_archive_size = 50 * 1024 * 1024  # 50MB limit
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in target_path.rglob('*'):
+                # Skip .git directory
+                if '.git' in file_path.parts:
+                    continue
+
+                # Skip hidden files if not included
+                if not include_hidden:
+                    relative_parts = file_path.relative_to(target_path).parts
+                    if any(part.startswith('.') for part in relative_parts):
+                        continue
+
+                # Only add files, not directories
+                if file_path.is_file():
+                    arcname = str(file_path.relative_to(target_path))
+
+                    try:
+                        file_size = file_path.stat().st_size
+                        if file_size > 10 * 1024 * 1024:  # Skip files larger than 10MB
+                            continue
+
+                        zip_file.write(file_path, arcname)
+
+                        # Check size limit
+                        if zip_buffer.tell() > max_archive_size:
+                            break
+                    except (PermissionError, OSError):
+                        continue
+
+        zip_buffer.seek(0)
+        yield zip_buffer.read()
+
+    return StreamingResponse(
+        generate_zip(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f"attachment; filename={archive_name}.zip"
+        }
+    )
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: Request):
     """Main MCP protocol endpoint (Streamable HTTP transport)"""
@@ -1001,7 +1066,8 @@ async def root():
         "endpoints": {
             "mcp": "/mcp",
             "health": "/health",
-            "capabilities": "/capabilities"
+            "capabilities": "/capabilities",
+            "download": "/download/{repo_name}"
         },
         "documentation": "https://modelcontextprotocol.io/specification/2025-06-18"
     }
