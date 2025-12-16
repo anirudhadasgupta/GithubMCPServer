@@ -540,8 +540,12 @@ async def get_tree_impl(
         logger.warning(f"[TOOL:get_tree] Path does not exist: {path}")
         return {"error": f"Path '{path}' does not exist", "tree": ""}
 
+    # Limit output to prevent large responses
+    MAX_TREE_LINES = 200
+    line_count = [0]  # Use list to allow modification in nested function
+
     def build_tree(current_path: Path, prefix: str = "", depth: int = 0) -> list:
-        if depth > max_depth:
+        if depth > max_depth or line_count[0] >= MAX_TREE_LINES:
             return []
 
         lines = []
@@ -555,30 +559,44 @@ async def get_tree_impl(
             items = [i for i in items if not i.name.startswith('.')]
 
         for i, item in enumerate(items):
+            if line_count[0] >= MAX_TREE_LINES:
+                break
+
             is_last = i == len(items) - 1
-            connector = "└── " if is_last else "├── "
+            # Use ASCII characters for better compatibility
+            connector = "+-- " if is_last else "|-- "
 
             if item.is_dir():
                 lines.append(f"{prefix}{connector}{item.name}/")
-                extension = "    " if is_last else "│   "
+                line_count[0] += 1
+                extension = "    " if is_last else "|   "
                 lines.extend(build_tree(item, prefix + extension, depth + 1))
             else:
                 size = item.stat().st_size
                 size_str = f" ({size:,} bytes)" if size < 1024 * 1024 else f" ({size / 1024 / 1024:.1f} MB)"
                 lines.append(f"{prefix}{connector}{item.name}{size_str}")
+                line_count[0] += 1
 
         return lines
 
     tree_lines = [f"{target_path.name}/"]
+    line_count[0] = 1
     tree_lines.extend(build_tree(target_path))
 
-    logger.info(f"[TOOL:get_tree] Complete: {len(tree_lines)} lines in tree")
-    return {
+    truncated = line_count[0] >= MAX_TREE_LINES
+    logger.info(f"[TOOL:get_tree] Complete: {len(tree_lines)} lines in tree, truncated={truncated}")
+
+    result = {
         "success": True,
         "repo_name": repo_name,
         "path": path,
         "tree": "\n".join(tree_lines)
     }
+    if truncated:
+        result["truncated"] = True
+        result["note"] = f"Output limited to {MAX_TREE_LINES} lines. Use path parameter to explore subdirectories."
+
+    return result
 
 
 async def read_file_impl(
