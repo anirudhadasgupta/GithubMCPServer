@@ -82,6 +82,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Request logging middleware - logs every request immediately on arrival
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests immediately for debugging connection issues."""
+    client = request.client.host if request.client else "unknown"
+    logger.info(f"[HTTP] {request.method} {request.url.path} from {client}")
+
+    response = await call_next(request)
+
+    logger.info(f"[HTTP] {request.method} {request.url.path} → {response.status_code}")
+    return response
+
+
 # ============================================================================
 # Tool Definitions with MCP 2025-06-18 Specification
 # ============================================================================
