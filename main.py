@@ -1012,6 +1012,35 @@ async def download_repository(
     )
 
 
+@app.get("/sse")
+async def sse_stream(request: Request):
+    """
+    SSE streaming endpoint for keeping connection alive.
+    Sends heartbeat pings every 15 seconds to prevent connection timeout.
+    """
+    async def event_generator():
+        try:
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+                # Send heartbeat ping
+                yield f"data: {json.dumps({'type': 'ping', 'timestamp': datetime.utcnow().isoformat() + 'Z'})}\n\n"
+                await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
 @app.post("/sse")
 async def mcp_endpoint(request: Request):
     """Main MCP protocol endpoint (Streamable HTTP transport)"""
