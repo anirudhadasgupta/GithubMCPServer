@@ -698,7 +698,8 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
 async def archive_repository_impl(
     repo_name: str,
     include_hidden: bool = False,
-    path: str = ""
+    path: str = "",
+    base_url: str = ""
 ) -> dict:
     """
     Generate a download URL for a repository archive as a ZIP file.
@@ -753,7 +754,9 @@ async def archive_repository_impl(
             file_count += 1
 
     # Build download URL with query parameters
-    download_url = f"{BASE_URL}/download/{repo_name}"
+    # Use provided base_url (from request) or fall back to configured BASE_URL
+    effective_base_url = base_url or BASE_URL
+    download_url = f"{effective_base_url}/download/{repo_name}"
     query_params = []
     if include_hidden:
         query_params.append("include_hidden=true")
@@ -778,7 +781,7 @@ async def archive_repository_impl(
 # MCP Protocol Handler
 # ============================================================================
 
-async def handle_mcp_request(request_data: dict) -> dict:
+async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
     """Handle MCP JSON-RPC requests"""
     method = request_data.get("method", "")
     params = request_data.get("params", {})
@@ -822,7 +825,7 @@ async def handle_mcp_request(request_data: dict) -> dict:
             elif tool_name == "get_outline":
                 tool_result = await get_outline_impl(**tool_args)
             elif tool_name == "archive_repository":
-                tool_result = await archive_repository_impl(**tool_args)
+                tool_result = await archive_repository_impl(**tool_args, base_url=base_url)
             else:
                 error = {
                     "code": -32601,
@@ -1015,17 +1018,23 @@ async def mcp_endpoint(request: Request):
     try:
         body = await request.json()
 
+        # Extract base URL from request for constructing download links
+        # Use X-Forwarded-Proto/Host headers if behind a proxy, otherwise use request URL
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
+        base_url = f"{scheme}://{host}"
+
         # Handle batch requests
         if isinstance(body, list):
             responses = []
             for req in body:
-                resp = await handle_mcp_request(req)
+                resp = await handle_mcp_request(req, base_url=base_url)
                 if resp is not None:
                     responses.append(resp)
             return JSONResponse(content=responses)
 
         # Handle single request
-        response = await handle_mcp_request(body)
+        response = await handle_mcp_request(body, base_url=base_url)
         if response is None:
             return Response(status_code=204)
 
