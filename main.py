@@ -82,6 +82,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Request logging middleware - logs every request immediately on arrival
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests immediately for debugging connection issues."""
+    client = request.client.host if request.client else "unknown"
+    logger.info(f"[HTTP] {request.method} {request.url.path} from {client}")
+
+    response = await call_next(request)
+
+    logger.info(f"[HTTP] {request.method} {request.url.path} → {response.status_code}")
+    return response
+
+
 # ============================================================================
 # Tool Definitions with MCP 2025-06-18 Specification
 # ============================================================================
@@ -1123,16 +1137,20 @@ async def capabilities():
 async def sse_stream(request: Request):
     """
     SSE streaming endpoint (OPTIONAL - for backwards compatibility).
-    
+
     NOTE: ChatGPT does NOT use this endpoint well. The POST /sse endpoint
     is preferred for stateless operation.
     """
-    session_id = str(uuid.uuid4())
+    # Generate deterministic session ID based on client info for stability
+    client_host = request.client.host if request.client else "unknown"
+    base_url = get_base_url_from_request(request)
+    client_fingerprint = f"{client_host}:{base_url}"
+    session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, client_fingerprint))
+
     message_queue: asyncio.Queue = asyncio.Queue()
     sse_sessions[session_id] = message_queue
 
-    base_url = get_base_url_from_request(request)
-    logger.info(f"[SSE] New connection, session_id={session_id}")
+    logger.info(f"[SSE] Connection, session_id={session_id[:8]} (client: {client_host})")
 
     async def event_generator():
         try:
@@ -1289,10 +1307,16 @@ async def mcp_endpoint(request: Request):
         method = body.get("method", "") if isinstance(body, dict) else ""
         logger.info(f"[POST /sse] [{request_id}] method={method}")
 
-        # Generate new session ID for initialize (tracking only)
+        # Session ID handling for initialize
+        # CRITICAL: Use stable session ID to prevent URI rotation issues with ChatGPT
         if method == "initialize":
-            session_id = str(uuid.uuid4())
-            logger.info(f"[POST /sse] [{request_id}] New session: {session_id[:8]}")
+            # If client provided a session ID, keep using it (re-initialization)
+            if not session_id:
+                # Generate deterministic session ID based on client info for stability
+                # This ensures the same client gets the same session across reconnects
+                client_fingerprint = f"{client_host}:{base_url}"
+                session_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, client_fingerprint))
+            logger.info(f"[POST /sse] [{request_id}] Session: {session_id[:8]} (client: {client_host})")
 
         # Handle batch requests
         if isinstance(body, list):
