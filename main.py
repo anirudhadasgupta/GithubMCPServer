@@ -89,13 +89,22 @@ TOOLS = [
     {
         "name": "clone_repository",
         "title": "Clone Repository",
-        "description": f"Clone a GitHub repository from user '{ALLOWED_USERNAME}'. The repository will be available for searching and browsing.",
+        "description": f"""Clone a GitHub repository from user '{ALLOWED_USERNAME}' to make it available for exploration.
+
+IMPORTANT: You MUST call this tool first before using any other tools on a repository.
+
+Instructions:
+1. Call this with the repository name (e.g., "my-project")
+2. Wait for success confirmation before proceeding
+3. The repo will then be available for search_code, get_tree, read_file, and get_outline
+
+Example: clone_repository(repo_name="CLARIOERP_WMS")""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository to clone (without owner prefix)"
+                    "description": "Name of the repository to clone (without owner prefix, e.g., 'my-project' not 'user/my-project')"
                 }
             },
             "required": ["repo_name"]
@@ -110,31 +119,41 @@ TOOLS = [
     {
         "name": "search_code",
         "title": "Search Code",
-        "description": "Search for code patterns in a cloned repository using fast grep/ripgrep-style search. Returns matching lines with context.",
+        "description": """Search for code patterns in a cloned repository using grep-style search.
+
+PREREQUISITE: Repository must be cloned first using clone_repository.
+
+Instructions:
+1. Provide the repo_name exactly as used in clone_repository
+2. Use pattern for the search term (supports regex)
+3. Optionally filter by file type with file_pattern (e.g., "*.py", "*.ts")
+4. Results include file path, line number, and matching content
+
+Example: search_code(repo_name="CLARIOERP_WMS", pattern="async function", file_pattern="*.ts")""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository to search in"
+                    "description": "Name of the repository (must be cloned first)"
                 },
                 "pattern": {
                     "type": "string",
-                    "description": "Search pattern (supports regex)"
+                    "description": "Search pattern - can be literal text or regex"
                 },
                 "file_pattern": {
                     "type": "string",
-                    "description": "Optional glob pattern to filter files (e.g., '*.py', '*.js')"
+                    "description": "Glob pattern to filter files (e.g., '*.py', '*.js', 'src/*.ts')"
                 },
                 "case_sensitive": {
                     "type": "boolean",
-                    "description": "Whether search is case-sensitive",
+                    "description": "Whether search is case-sensitive (default: false)",
                     "default": False
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of results to return",
-                    "default": 50
+                    "description": "Maximum results to return (default: 20)",
+                    "default": 20
                 }
             },
             "required": ["repo_name", "pattern"]
@@ -149,27 +168,37 @@ TOOLS = [
     {
         "name": "get_tree",
         "title": "Get Repository Tree",
-        "description": "Display the directory structure of a cloned repository as a tree view.",
+        "description": """Display the directory structure of a cloned repository as a tree view.
+
+PREREQUISITE: Repository must be cloned first using clone_repository.
+
+Instructions:
+1. Provide the repo_name exactly as used in clone_repository
+2. Optionally specify a subdirectory path to focus on
+3. Use max_depth to control how deep to traverse (default: 3)
+4. Output is limited to 200 lines - use path parameter for large repos
+
+Example: get_tree(repo_name="CLARIOERP_WMS", path="src/components", max_depth=2)""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository"
+                    "description": "Name of the repository (must be cloned first)"
                 },
                 "path": {
                     "type": "string",
-                    "description": "Subdirectory path to start from",
+                    "description": "Subdirectory path to start from (e.g., 'src/components')",
                     "default": "."
                 },
                 "max_depth": {
                     "type": "integer",
-                    "description": "Maximum depth of tree traversal",
+                    "description": "Maximum depth of tree traversal (default: 3)",
                     "default": 3
                 },
                 "show_hidden": {
                     "type": "boolean",
-                    "description": "Whether to show hidden files/directories",
+                    "description": "Whether to show hidden files/directories (default: false)",
                     "default": False
                 }
             },
@@ -185,26 +214,37 @@ TOOLS = [
     {
         "name": "read_file",
         "title": "Read File",
-        "description": "Read the contents of a file from a cloned repository. Supports partial reads with line ranges.",
+        "description": """Read the contents of a file from a cloned repository.
+
+PREREQUISITE: Repository must be cloned first using clone_repository.
+
+Instructions:
+1. Provide the repo_name exactly as used in clone_repository
+2. Provide the full file_path relative to repo root (e.g., "src/index.ts")
+3. For large files, use start_line and end_line to read specific sections
+4. Output is limited to 200 lines per call - use line ranges for longer files
+
+Example: read_file(repo_name="CLARIOERP_WMS", file_path="src/App.tsx")
+Example with range: read_file(repo_name="CLARIOERP_WMS", file_path="src/App.tsx", start_line=1, end_line=50)""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository"
+                    "description": "Name of the repository (must be cloned first)"
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Path to the file within the repository"
+                    "description": "Path to the file relative to repo root (e.g., 'src/index.ts', 'package.json')"
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "Starting line number (1-indexed)",
+                    "description": "Starting line number, 1-indexed (default: 1)",
                     "default": 1
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "Ending line number (inclusive, 0 for entire file)",
+                    "description": "Ending line number, inclusive. Use 0 for auto-limit (default: 0)",
                     "default": 0
                 }
             },
@@ -220,51 +260,30 @@ TOOLS = [
     {
         "name": "get_outline",
         "title": "Get Code Outline",
-        "description": "Get the structural outline of a code file showing classes, functions, and methods with their line numbers.",
+        "description": """Get the structural outline of a code file showing classes, functions, and methods with line numbers.
+
+PREREQUISITE: Repository must be cloned first using clone_repository.
+
+Instructions:
+1. Provide the repo_name exactly as used in clone_repository
+2. Provide the full file_path relative to repo root
+3. Works best with Python (.py), JavaScript/TypeScript (.js, .ts, .jsx, .tsx)
+4. Returns list of classes and functions with their line numbers
+
+Example: get_outline(repo_name="CLARIOERP_WMS", file_path="src/services/api.ts")""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository"
+                    "description": "Name of the repository (must be cloned first)"
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Path to the code file within the repository"
+                    "description": "Path to the code file relative to repo root"
                 }
             },
             "required": ["repo_name", "file_path"]
-        },
-        "annotations": {
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "idempotentHint": True,
-            "openWorldHint": False
-        }
-    },
-    {
-        "name": "archive_repository",
-        "title": "Archive Repository",
-        "description": "Get a download link for a cloned repository as a ZIP file. Returns a URL that can be used to download the entire repository (or a subdirectory) for local analysis. The .git directory is excluded to reduce size. ChatGPT can use this URL to download and extract the repository.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "repo_name": {
-                    "type": "string",
-                    "description": "Name of the repository to archive"
-                },
-                "include_hidden": {
-                    "type": "boolean",
-                    "description": "Whether to include hidden files (starting with .) except .git",
-                    "default": False
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Optional subdirectory path to archive (defaults to entire repo)",
-                    "default": ""
-                }
-            },
-            "required": ["repo_name"]
         },
         "annotations": {
             "readOnlyHint": True,
@@ -926,6 +945,117 @@ async def archive_repository_impl(
 # MCP Protocol Handler
 # ============================================================================
 
+def format_result_as_markdown(tool_name: str, result: dict) -> str:
+    """Format tool result as structured markdown for better readability."""
+
+    # Handle errors
+    if "error" in result:
+        return f"""## Error
+
+**Tool:** `{tool_name}`
+**Error:** {result['error']}
+
+**Suggestion:** Make sure the repository is cloned first using `clone_repository`."""
+
+    # Format based on tool type
+    if tool_name == "clone_repository":
+        status = "SUCCESS" if result.get("success") else "FAILED"
+        return f"""## Clone Repository - {status}
+
+**Status:** {result.get('status', 'unknown')}
+**Message:** {result.get('message', 'No message')}
+**Path:** `{result.get('path', 'N/A')}`
+
+The repository is now available for exploration with other tools."""
+
+    elif tool_name == "search_code":
+        matches = result.get("matches", [])
+        total = result.get("total_matches", len(matches))
+        truncated = result.get("truncated", False)
+
+        if not matches:
+            return f"""## Search Results
+
+**Pattern:** `{result.get('pattern', '')}`
+**Matches:** 0
+
+No matches found."""
+
+        lines = [f"""## Search Results
+
+**Pattern:** `{result.get('pattern', '')}`
+**Matches:** {total}{' (truncated)' if truncated else ''}
+
+### Matches:
+"""]
+        for m in matches[:20]:  # Limit display
+            lines.append(f"- **{m['file']}** (line {m['line']}): `{m['content'][:100]}`")
+
+        return "\n".join(lines)
+
+    elif tool_name == "get_tree":
+        tree = result.get("tree", "")
+        truncated = result.get("truncated", False)
+
+        return f"""## Directory Tree
+
+**Repository:** `{result.get('repo_name', '')}`
+**Path:** `{result.get('path', '.')}`
+{f"**Note:** {result.get('note', '')}" if truncated else ""}
+
+```
+{tree}
+```"""
+
+    elif tool_name == "read_file":
+        content = result.get("content", "")
+        truncated = result.get("truncated", False)
+
+        return f"""## File Contents
+
+**Repository:** `{result.get('repo_name', '')}`
+**File:** `{result.get('file_path', '')}`
+**Lines:** {result.get('start_line', 1)}-{result.get('end_line', '?')} of {result.get('total_lines', '?')}
+**Size:** {result.get('file_size', 0):,} bytes
+{f"**Note:** {result.get('note', '')}" if truncated else ""}
+
+```
+{content}
+```"""
+
+    elif tool_name == "get_outline":
+        outline = result.get("outline", [])
+
+        if not outline:
+            return f"""## Code Outline
+
+**File:** `{result.get('file_path', '')}`
+**Type:** `{result.get('file_type', '')}`
+
+No classes or functions found."""
+
+        lines = [f"""## Code Outline
+
+**File:** `{result.get('file_path', '')}`
+**Type:** `{result.get('file_type', '')}`
+**Items:** {len(outline)}
+
+### Structure:
+"""]
+        for item in outline:
+            type_label = item['type'].upper()
+            lines.append(f"- [{type_label}] **{item['name']}** - line {item['line']}")
+
+        return "\n".join(lines)
+
+    # Default: return as JSON
+    return f"""## Result
+
+```json
+{json.dumps(result, indent=2)}
+```"""
+
+
 def truncate_response(response: dict, max_size: int = MAX_RESPONSE_SIZE) -> dict:
     """Truncate response if it exceeds max size to prevent connection issues."""
     response_str = json.dumps(response)
@@ -1004,8 +1134,6 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
                 tool_result = await read_file_impl(**tool_args)
             elif tool_name == "get_outline":
                 tool_result = await get_outline_impl(**tool_args)
-            elif tool_name == "archive_repository":
-                tool_result = await archive_repository_impl(**tool_args, base_url=base_url)
             else:
                 error = {
                     "code": -32601,
@@ -1015,11 +1143,13 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
 
             if tool_result is not None:
                 is_error = "error" in tool_result and not tool_result.get("success", True)
+                # Format as markdown for better readability
+                formatted_text = format_result_as_markdown(tool_name, tool_result)
                 result = {
                     "content": [
                         {
                             "type": "text",
-                            "text": json.dumps(tool_result, indent=2)
+                            "text": formatted_text
                         }
                     ],
                     "isError": is_error
