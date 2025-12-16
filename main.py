@@ -1145,10 +1145,10 @@ async def sse_stream(request: Request):
                     break
 
                 try:
-                    message = await asyncio.wait_for(message_queue.get(), timeout=15.0)
+                    message = await asyncio.wait_for(message_queue.get(), timeout=30.0)
                     yield f"event: message\ndata: {json.dumps(message)}\n\n"
                 except asyncio.TimeoutError:
-                    # Heartbeat
+                    # Heartbeat every 30s to prevent load balancer idle timeout
                     yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
 
         except asyncio.CancelledError:
@@ -1160,9 +1160,12 @@ async def sse_stream(request: Request):
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+            "X-Content-Type-Options": "nosniff",
+            "Content-Encoding": "identity",  # No gzip - ensures instant data transmission
+            "Transfer-Encoding": "chunked",
         }
     )
 
@@ -1262,12 +1265,16 @@ async def mcp_endpoint(request: Request):
     session_id = request.headers.get("mcp-session-id")
     
     # Standard headers for all responses to maintain connection stability
+    # Configured for Railway/load balancer compatibility
     stability_headers = {
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
         "Expires": "0",
-        "Connection": "keep-alive",
+        "Connection": "keep-alive",  # Tells Railway not to close the socket
         "Keep-Alive": "timeout=300, max=1000",
+        "X-Accel-Buffering": "no",  # Disable nginx/proxy buffering
+        "X-Content-Type-Options": "nosniff",
+        "Content-Encoding": "identity",  # No gzip - ensures instant data transmission
         "X-MCP-Server-Version": "1.0.0",
         "X-MCP-Protocol-Version": "2024-11-05",
         "X-Request-Id": request_id,
