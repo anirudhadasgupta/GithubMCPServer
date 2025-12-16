@@ -16,6 +16,7 @@ import asyncio
 import subprocess
 import zipfile
 import io
+import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Any
@@ -36,6 +37,10 @@ ALLOWED_USERNAME = os.getenv("ALLOWED_USERNAME", "anirudhadasgupta")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 BASE_URL = os.getenv("BASE_URL", f"http://{HOST}:{PORT}")
+
+# Session management for SSE connections
+# Maps session_id -> asyncio.Queue for sending responses
+sse_sessions: dict[str, asyncio.Queue] = {}
 
 # Ensure storage path exists
 REPO_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
@@ -1012,23 +1017,58 @@ async def download_repository(
     )
 
 
+def get_base_url_from_request(request: Request) -> str:
+    """Extract base URL from request headers for constructing download links."""
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+
+    if not host or "0.0.0.0" in host:
+        if BASE_URL and "0.0.0.0" not in BASE_URL:
+            return BASE_URL.rstrip("/")
+        else:
+            return f"{scheme}://{request.url.netloc}"
+    else:
+        return f"{scheme}://{host}"
+
+
 @app.get("/sse")
 async def sse_stream(request: Request):
     """
-    SSE streaming endpoint for keeping connection alive.
-    Sends heartbeat pings every 15 seconds to prevent connection timeout.
+    SSE streaming endpoint for MCP protocol.
+
+    1. Creates a session and sends the endpoint URL for POSTing messages
+    2. Streams responses and heartbeat pings every 15 seconds
     """
+    session_id = str(uuid.uuid4())
+    message_queue: asyncio.Queue = asyncio.Queue()
+    sse_sessions[session_id] = message_queue
+
+    base_url = get_base_url_from_request(request)
+
     async def event_generator():
         try:
+            # Send the endpoint URL as the first event
+            endpoint_url = f"{base_url}/messages?session_id={session_id}"
+            yield f"event: endpoint\ndata: {endpoint_url}\n\n"
+
             while True:
                 # Check if client disconnected
                 if await request.is_disconnected():
                     break
-                # Send heartbeat ping
-                yield f"data: {json.dumps({'type': 'ping', 'timestamp': datetime.utcnow().isoformat() + 'Z'})}\n\n"
-                await asyncio.sleep(15)
+
+                # Check for messages with timeout for heartbeat
+                try:
+                    message = await asyncio.wait_for(message_queue.get(), timeout=15.0)
+                    yield f"event: message\ndata: {json.dumps(message)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send heartbeat ping
+                    yield f"event: ping\ndata: {json.dumps({'type': 'ping', 'timestamp': datetime.utcnow().isoformat() + 'Z'})}\n\n"
+
         except asyncio.CancelledError:
             pass
+        finally:
+            # Cleanup session
+            sse_sessions.pop(session_id, None)
 
     return StreamingResponse(
         event_generator(),
@@ -1041,26 +1081,63 @@ async def sse_stream(request: Request):
     )
 
 
-@app.post("/sse")
-async def mcp_endpoint(request: Request):
-    """Main MCP protocol endpoint (Streamable HTTP transport)"""
+@app.post("/messages")
+async def mcp_messages(request: Request, session_id: str = Query(...)):
+    """
+    Receive MCP messages and push responses to the SSE stream.
+    """
+    if session_id not in sse_sessions:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Session not found. Connect to /sse first."}
+        )
+
+    message_queue = sse_sessions[session_id]
+    base_url = get_base_url_from_request(request)
+
     try:
         body = await request.json()
 
-        # Extract base URL from request for constructing download links
-        # Priority: 1) X-Forwarded headers (Railway/proxy), 2) Host header, 3) BASE_URL env var
-        scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
-        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
-
-        # If host contains 0.0.0.0 or is empty, try BASE_URL env var (if it's a real URL)
-        if not host or "0.0.0.0" in host:
-            if BASE_URL and "0.0.0.0" not in BASE_URL:
-                base_url = BASE_URL.rstrip("/")
-            else:
-                # Last resort - use request URL but this likely won't work externally
-                base_url = f"{scheme}://{request.url.netloc}"
+        # Handle batch requests
+        if isinstance(body, list):
+            for req in body:
+                response = await handle_mcp_request(req, base_url=base_url)
+                if response is not None:
+                    await message_queue.put(response)
         else:
-            base_url = f"{scheme}://{host}"
+            response = await handle_mcp_request(body, base_url=base_url)
+            if response is not None:
+                await message_queue.put(response)
+
+        return Response(status_code=202)  # Accepted
+
+    except json.JSONDecodeError:
+        error_response = {
+            "jsonrpc": "2.0",
+            "error": {"code": -32700, "message": "Parse error"},
+            "id": None
+        }
+        await message_queue.put(error_response)
+        return Response(status_code=202)
+    except Exception as e:
+        error_response = {
+            "jsonrpc": "2.0",
+            "error": {"code": -32603, "message": str(e)},
+            "id": None
+        }
+        await message_queue.put(error_response)
+        return Response(status_code=202)
+
+
+@app.post("/sse")
+async def mcp_endpoint(request: Request):
+    """
+    Direct MCP protocol endpoint (Streamable HTTP transport).
+    For clients that don't use SSE, this provides direct request/response.
+    """
+    try:
+        body = await request.json()
+        base_url = get_base_url_from_request(request)
 
         # Handle batch requests
         if isinstance(body, list):
@@ -1083,10 +1160,7 @@ async def mcp_endpoint(request: Request):
             status_code=400,
             content={
                 "jsonrpc": "2.0",
-                "error": {
-                    "code": -32700,
-                    "message": "Parse error"
-                },
+                "error": {"code": -32700, "message": "Parse error"},
                 "id": None
             }
         )
@@ -1095,10 +1169,7 @@ async def mcp_endpoint(request: Request):
             status_code=500,
             content={
                 "jsonrpc": "2.0",
-                "error": {
-                    "code": -32603,
-                    "message": str(e)
-                },
+                "error": {"code": -32603, "message": str(e)},
                 "id": None
             }
         )
@@ -1111,7 +1182,8 @@ async def root():
         "name": "GitHub Search MCP Server",
         "version": "1.0.0",
         "endpoints": {
-            "sse": "/sse",
+            "sse": "/sse (GET for SSE stream, POST for direct requests)",
+            "messages": "/messages?session_id=<id> (POST MCP messages for SSE sessions)",
             "health": "/health",
             "capabilities": "/capabilities",
             "download": "/download/{repo_name}"
