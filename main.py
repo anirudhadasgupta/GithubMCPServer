@@ -85,26 +85,36 @@ app.add_middleware(
 # Tool Definitions with MCP 2025-06-18 Specification
 # ============================================================================
 
+# Server metadata for tool discovery
+SERVER_INFO = {
+    "name": "github-search-mcp",
+    "version": "1.0.0",
+    "author": "anirudhadasgupta",
+    "description": "MCP server for exploring GitHub repositories. Clone repos, search code, browse files, and analyze structure.",
+    "capabilities": ["clone", "search", "browse", "read", "outline"],
+    "workflow": [
+        "1. First call clone_repository with the repo name",
+        "2. Then use other tools to explore the cloned repo",
+        "3. All paths are relative to repo root (e.g., 'src/App.tsx')"
+    ],
+    "limits": {
+        "max_file_lines": 200,
+        "max_tree_lines": 200,
+        "max_search_results": 20
+    }
+}
+
 TOOLS = [
     {
         "name": "clone_repository",
         "title": "Clone Repository",
-        "description": f"""Clone a GitHub repository from user '{ALLOWED_USERNAME}' to make it available for exploration.
-
-IMPORTANT: You MUST call this tool first before using any other tools on a repository.
-
-Instructions:
-1. Call this with the repository name (e.g., "my-project")
-2. Wait for success confirmation before proceeding
-3. The repo will then be available for search_code, get_tree, read_file, and get_outline
-
-Example: clone_repository(repo_name="CLARIOERP_WMS")""",
+        "description": "Clone a GitHub repository to make it available for exploration. MUST be called first before using other tools.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository to clone (without owner prefix, e.g., 'my-project' not 'user/my-project')"
+                    "description": "Repository name without owner prefix (e.g., 'my-project')"
                 }
             },
             "required": ["repo_name"]
@@ -114,45 +124,48 @@ Example: clone_repository(repo_name="CLARIOERP_WMS")""",
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": True
+        },
+        "usage": {
+            "prerequisite": None,
+            "instructions": [
+                "Call with repository name only",
+                "Wait for success confirmation",
+                "Then use other tools to explore"
+            ],
+            "example": {
+                "call": "clone_repository",
+                "arguments": {"repo_name": "CLARIOERP_WMS"}
+            },
+            "returns": ["status", "message", "path"]
         }
     },
     {
         "name": "search_code",
         "title": "Search Code",
-        "description": """Search for code patterns in a cloned repository using grep-style search.
-
-PREREQUISITE: Repository must be cloned first using clone_repository.
-
-Instructions:
-1. Provide the repo_name exactly as used in clone_repository
-2. Use pattern for the search term (supports regex)
-3. Optionally filter by file type with file_pattern (e.g., "*.py", "*.ts")
-4. Results include file path, line number, and matching content
-
-Example: search_code(repo_name="CLARIOERP_WMS", pattern="async function", file_pattern="*.ts")""",
+        "description": "Search for code patterns in a cloned repository using grep. Returns matching lines with file paths and line numbers.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository (must be cloned first)"
+                    "description": "Repository name (must be cloned first)"
                 },
                 "pattern": {
                     "type": "string",
-                    "description": "Search pattern - can be literal text or regex"
+                    "description": "Search pattern (literal text or regex)"
                 },
                 "file_pattern": {
                     "type": "string",
-                    "description": "Glob pattern to filter files (e.g., '*.py', '*.js', 'src/*.ts')"
+                    "description": "Glob filter (e.g., '*.py', '*.ts', 'src/*.js')"
                 },
                 "case_sensitive": {
                     "type": "boolean",
-                    "description": "Whether search is case-sensitive (default: false)",
+                    "description": "Case-sensitive search",
                     "default": False
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum results to return (default: 20)",
+                    "description": "Maximum results",
                     "default": 20
                 }
             },
@@ -163,42 +176,45 @@ Example: search_code(repo_name="CLARIOERP_WMS", pattern="async function", file_p
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False
+        },
+        "usage": {
+            "prerequisite": "clone_repository",
+            "instructions": [
+                "Provide repo_name exactly as used in clone",
+                "Use pattern for search term",
+                "Optionally filter by file type"
+            ],
+            "example": {
+                "call": "search_code",
+                "arguments": {"repo_name": "CLARIOERP_WMS", "pattern": "async function", "file_pattern": "*.ts"}
+            },
+            "returns": ["matches[].file", "matches[].line", "matches[].content"]
         }
     },
     {
         "name": "get_tree",
         "title": "Get Repository Tree",
-        "description": """Display the directory structure of a cloned repository as a tree view.
-
-PREREQUISITE: Repository must be cloned first using clone_repository.
-
-Instructions:
-1. Provide the repo_name exactly as used in clone_repository
-2. Optionally specify a subdirectory path to focus on
-3. Use max_depth to control how deep to traverse (default: 3)
-4. Output is limited to 200 lines - use path parameter for large repos
-
-Example: get_tree(repo_name="CLARIOERP_WMS", path="src/components", max_depth=2)""",
+        "description": "Display directory structure of a cloned repository as a tree view. Limited to 200 lines.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository (must be cloned first)"
+                    "description": "Repository name (must be cloned first)"
                 },
                 "path": {
                     "type": "string",
-                    "description": "Subdirectory path to start from (e.g., 'src/components')",
+                    "description": "Subdirectory path (e.g., 'src/components')",
                     "default": "."
                 },
                 "max_depth": {
                     "type": "integer",
-                    "description": "Maximum depth of tree traversal (default: 3)",
+                    "description": "Tree depth limit",
                     "default": 3
                 },
                 "show_hidden": {
                     "type": "boolean",
-                    "description": "Whether to show hidden files/directories (default: false)",
+                    "description": "Include hidden files",
                     "default": False
                 }
             },
@@ -209,42 +225,44 @@ Example: get_tree(repo_name="CLARIOERP_WMS", path="src/components", max_depth=2)
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False
+        },
+        "usage": {
+            "prerequisite": "clone_repository",
+            "instructions": [
+                "Provide repo_name exactly as used in clone",
+                "Use path to focus on subdirectory",
+                "Path is relative to repo root (not including repo name)"
+            ],
+            "example": {
+                "call": "get_tree",
+                "arguments": {"repo_name": "CLARIOERP_WMS", "path": "src", "max_depth": 2}
+            },
+            "returns": ["tree", "truncated"]
         }
     },
     {
         "name": "read_file",
         "title": "Read File",
-        "description": """Read the contents of a file from a cloned repository.
-
-PREREQUISITE: Repository must be cloned first using clone_repository.
-
-Instructions:
-1. Provide the repo_name exactly as used in clone_repository
-2. Provide the full file_path relative to repo root (e.g., "src/index.ts")
-3. For large files, use start_line and end_line to read specific sections
-4. Output is limited to 200 lines per call - use line ranges for longer files
-
-Example: read_file(repo_name="CLARIOERP_WMS", file_path="src/App.tsx")
-Example with range: read_file(repo_name="CLARIOERP_WMS", file_path="src/App.tsx", start_line=1, end_line=50)""",
+        "description": "Read contents of a file from a cloned repository. Limited to 200 lines per call.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository (must be cloned first)"
+                    "description": "Repository name (must be cloned first)"
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Path to the file relative to repo root (e.g., 'src/index.ts', 'package.json')"
+                    "description": "File path relative to repo root (e.g., 'src/App.tsx')"
                 },
                 "start_line": {
                     "type": "integer",
-                    "description": "Starting line number, 1-indexed (default: 1)",
+                    "description": "Starting line (1-indexed)",
                     "default": 1
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "Ending line number, inclusive. Use 0 for auto-limit (default: 0)",
+                    "description": "Ending line (0 = auto-limit)",
                     "default": 0
                 }
             },
@@ -255,32 +273,36 @@ Example with range: read_file(repo_name="CLARIOERP_WMS", file_path="src/App.tsx"
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False
+        },
+        "usage": {
+            "prerequisite": "clone_repository",
+            "instructions": [
+                "Provide repo_name exactly as used in clone",
+                "file_path is relative to repo root",
+                "Do NOT include repo name in file_path",
+                "Use line ranges for large files"
+            ],
+            "example": {
+                "call": "read_file",
+                "arguments": {"repo_name": "CLARIOERP_WMS", "file_path": "src/App.tsx", "start_line": 1, "end_line": 50}
+            },
+            "returns": ["content", "total_lines", "file_size"]
         }
     },
     {
         "name": "get_outline",
         "title": "Get Code Outline",
-        "description": """Get the structural outline of a code file showing classes, functions, and methods with line numbers.
-
-PREREQUISITE: Repository must be cloned first using clone_repository.
-
-Instructions:
-1. Provide the repo_name exactly as used in clone_repository
-2. Provide the full file_path relative to repo root
-3. Works best with Python (.py), JavaScript/TypeScript (.js, .ts, .jsx, .tsx)
-4. Returns list of classes and functions with their line numbers
-
-Example: get_outline(repo_name="CLARIOERP_WMS", file_path="src/services/api.ts")""",
+        "description": "Get structural outline of a code file showing classes, functions, and methods with line numbers.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "repo_name": {
                     "type": "string",
-                    "description": "Name of the repository (must be cloned first)"
+                    "description": "Repository name (must be cloned first)"
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Path to the code file relative to repo root"
+                    "description": "File path relative to repo root"
                 }
             },
             "required": ["repo_name", "file_path"]
@@ -290,6 +312,19 @@ Example: get_outline(repo_name="CLARIOERP_WMS", file_path="src/services/api.ts")
             "destructiveHint": False,
             "idempotentHint": True,
             "openWorldHint": False
+        },
+        "usage": {
+            "prerequisite": "clone_repository",
+            "instructions": [
+                "Provide repo_name exactly as used in clone",
+                "file_path is relative to repo root",
+                "Best for .py, .js, .ts, .jsx, .tsx files"
+            ],
+            "example": {
+                "call": "get_outline",
+                "arguments": {"repo_name": "CLARIOERP_WMS", "file_path": "src/services/api.ts"}
+            },
+            "returns": ["outline[].type", "outline[].name", "outline[].line"]
         }
     }
 ]
@@ -1124,8 +1159,11 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
             result = {
                 "protocolVersion": client_protocol,
                 "serverInfo": {
-                    "name": "github-search-mcp",
-                    "version": "1.0.0"
+                    "name": SERVER_INFO["name"],
+                    "version": SERVER_INFO["version"],
+                    "description": SERVER_INFO["description"],
+                    "workflow": SERVER_INFO["workflow"],
+                    "limits": SERVER_INFO["limits"]
                 },
                 "capabilities": {
                     "tools": {"listChanged": False},
