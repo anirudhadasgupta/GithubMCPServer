@@ -57,6 +57,11 @@ logger.info(f"MAX_RESPONSE_SIZE={MAX_RESPONSE_SIZE}")
 # Maps session_id -> asyncio.Queue for sending responses
 sse_sessions: dict[str, asyncio.Queue] = {}
 
+# Session management for streamable HTTP transport
+# Maps session_id -> {created_at, last_used, protocol_version}
+http_sessions: dict[str, dict] = {}
+SESSION_TIMEOUT_SECONDS = 3600  # 1 hour session timeout
+
 # Ensure storage path exists
 REPO_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -535,8 +540,12 @@ async def get_tree_impl(
         logger.warning(f"[TOOL:get_tree] Path does not exist: {path}")
         return {"error": f"Path '{path}' does not exist", "tree": ""}
 
+    # Limit output to prevent large responses
+    MAX_TREE_LINES = 200
+    line_count = [0]  # Use list to allow modification in nested function
+
     def build_tree(current_path: Path, prefix: str = "", depth: int = 0) -> list:
-        if depth > max_depth:
+        if depth > max_depth or line_count[0] >= MAX_TREE_LINES:
             return []
 
         lines = []
@@ -550,30 +559,44 @@ async def get_tree_impl(
             items = [i for i in items if not i.name.startswith('.')]
 
         for i, item in enumerate(items):
+            if line_count[0] >= MAX_TREE_LINES:
+                break
+
             is_last = i == len(items) - 1
-            connector = "└── " if is_last else "├── "
+            # Use ASCII characters for better compatibility
+            connector = "+-- " if is_last else "|-- "
 
             if item.is_dir():
                 lines.append(f"{prefix}{connector}{item.name}/")
-                extension = "    " if is_last else "│   "
+                line_count[0] += 1
+                extension = "    " if is_last else "|   "
                 lines.extend(build_tree(item, prefix + extension, depth + 1))
             else:
                 size = item.stat().st_size
                 size_str = f" ({size:,} bytes)" if size < 1024 * 1024 else f" ({size / 1024 / 1024:.1f} MB)"
                 lines.append(f"{prefix}{connector}{item.name}{size_str}")
+                line_count[0] += 1
 
         return lines
 
     tree_lines = [f"{target_path.name}/"]
+    line_count[0] = 1
     tree_lines.extend(build_tree(target_path))
 
-    logger.info(f"[TOOL:get_tree] Complete: {len(tree_lines)} lines in tree")
-    return {
+    truncated = line_count[0] >= MAX_TREE_LINES
+    logger.info(f"[TOOL:get_tree] Complete: {len(tree_lines)} lines in tree, truncated={truncated}")
+
+    result = {
         "success": True,
         "repo_name": repo_name,
         "path": path,
         "tree": "\n".join(tree_lines)
     }
+    if truncated:
+        result["truncated"] = True
+        result["note"] = f"Output limited to {MAX_TREE_LINES} lines. Use path parameter to explore subdirectories."
+
+    return result
 
 
 async def read_file_impl(
@@ -1312,20 +1335,75 @@ async def mcp_messages(request: Request, session_id: str = Query(...)):
         return Response(status_code=202)
 
 
+def cleanup_expired_sessions():
+    """Remove expired HTTP sessions"""
+    now = datetime.utcnow()
+    expired = []
+    for sid, session in http_sessions.items():
+        age = (now - session["created_at"]).total_seconds()
+        if age > SESSION_TIMEOUT_SECONDS:
+            expired.append(sid)
+    for sid in expired:
+        del http_sessions[sid]
+        logger.info(f"[SESSION] Expired session removed: {sid[:8]}")
+    if expired:
+        logger.info(f"[SESSION] Cleaned up {len(expired)} expired sessions. Active: {len(http_sessions)}")
+
+
 @app.post("/sse")
 async def mcp_endpoint(request: Request):
     """
     Direct MCP protocol endpoint (Streamable HTTP transport).
     For clients that don't use SSE, this provides direct request/response.
+    Supports Mcp-Session-Id header for session management.
     """
     client_host = request.client.host if request.client else "unknown"
     logger.info(f"[POST /sse] Request from {client_host}")
     logger.debug(f"[POST /sse] Request headers: {dict(request.headers)}")
 
+    # Periodic cleanup of expired sessions
+    cleanup_expired_sessions()
+
+    # Get session ID from request header
+    session_id = request.headers.get("mcp-session-id")
+    is_new_session = False
+    protocol_version = request.headers.get("mcp-protocol-version", "2025-06-18")
+
     try:
         body = await request.json()
         base_url = get_base_url_from_request(request)
-        logger.info(f"[POST /sse] Body: {json.dumps(body)[:500]}...")
+        method = body.get("method", "") if isinstance(body, dict) else ""
+        logger.info(f"[POST /sse] method={method}, session={session_id[:8] if session_id else 'none'}")
+        logger.debug(f"[POST /sse] Body: {json.dumps(body)[:500]}...")
+
+        # Handle initialize - create new session
+        if method == "initialize":
+            session_id = str(uuid.uuid4())
+            is_new_session = True
+            # Get protocol version from request body
+            if isinstance(body, dict) and "params" in body:
+                protocol_version = body["params"].get("protocolVersion", protocol_version)
+            # Store session
+            http_sessions[session_id] = {
+                "created_at": datetime.utcnow(),
+                "last_used": datetime.utcnow(),
+                "protocol_version": protocol_version,
+                "client_host": client_host
+            }
+            logger.info(f"[POST /sse] New session created: {session_id[:8]}, protocol={protocol_version}, active_sessions={len(http_sessions)}")
+
+        # Validate existing session
+        elif session_id:
+            if session_id in http_sessions:
+                http_sessions[session_id]["last_used"] = datetime.utcnow()
+                logger.debug(f"[POST /sse] Valid session: {session_id[:8]}")
+            else:
+                # Session not found - this might be why tools "drop"
+                # Be lenient: accept the request but log a warning
+                logger.warning(f"[POST /sse] Unknown session ID: {session_id[:8]} - accepting anyway")
+        else:
+            # No session ID provided for non-initialize request
+            logger.warning(f"[POST /sse] No session ID for method={method}")
 
         # Handle batch requests
         if isinstance(body, list):
@@ -1335,20 +1413,31 @@ async def mcp_endpoint(request: Request):
                 resp = await handle_mcp_request(req, base_url=base_url)
                 if resp is not None:
                     responses.append(resp)
-            return JSONResponse(content=responses)
+            response = JSONResponse(content=responses)
+        else:
+            # Handle single request
+            mcp_response = await handle_mcp_request(body, base_url=base_url)
+            if mcp_response is None:
+                logger.info("[POST /sse] No response (204)")
+                resp = Response(status_code=204)
+                if session_id:
+                    resp.headers["Mcp-Session-Id"] = session_id
+                return resp
 
-        # Handle single request
-        response = await handle_mcp_request(body, base_url=base_url)
-        if response is None:
-            logger.info("[POST /sse] No response (204)")
-            return Response(status_code=204)
+            logger.info(f"[POST /sse] Response: {json.dumps(mcp_response)[:200]}...")
+            response = JSONResponse(content=mcp_response)
 
-        logger.info(f"[POST /sse] Response: {json.dumps(response)[:200]}...")
-        return JSONResponse(content=response)
+        # Include session ID in response headers
+        if session_id:
+            response.headers["Mcp-Session-Id"] = session_id
+            if is_new_session:
+                logger.info(f"[POST /sse] Returning new Mcp-Session-Id: {session_id[:8]}")
+
+        return response
 
     except json.JSONDecodeError as e:
         logger.error(f"[POST /sse] JSON parse error: {e}")
-        return JSONResponse(
+        error_response = JSONResponse(
             status_code=400,
             content={
                 "jsonrpc": "2.0",
@@ -1356,9 +1445,12 @@ async def mcp_endpoint(request: Request):
                 "id": None
             }
         )
+        if session_id:
+            error_response.headers["Mcp-Session-Id"] = session_id
+        return error_response
     except Exception as e:
         logger.error(f"[POST /sse] Error: {e}", exc_info=True)
-        return JSONResponse(
+        error_response = JSONResponse(
             status_code=500,
             content={
                 "jsonrpc": "2.0",
@@ -1366,6 +1458,9 @@ async def mcp_endpoint(request: Request):
                 "id": None
             }
         )
+        if session_id:
+            error_response.headers["Mcp-Session-Id"] = session_id
+        return error_response
 
 
 @app.get("/")
