@@ -854,8 +854,11 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
     try:
         # Initialize
         if method == "initialize":
+            # Echo back the client's protocol version for compatibility
+            client_protocol = params.get("protocolVersion", "2025-06-18")
+            logger.info(f"[MCP] Client protocol version: {client_protocol}")
             result = {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": client_protocol,
                 "serverInfo": {
                     "name": "github-search-mcp",
                     "version": "1.0.0"
