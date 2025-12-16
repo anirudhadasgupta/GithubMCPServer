@@ -57,6 +57,11 @@ logger.info(f"MAX_RESPONSE_SIZE={MAX_RESPONSE_SIZE}")
 # Maps session_id -> asyncio.Queue for sending responses
 sse_sessions: dict[str, asyncio.Queue] = {}
 
+# Session management for streamable HTTP transport
+# Maps session_id -> {created_at, last_used, protocol_version}
+http_sessions: dict[str, dict] = {}
+SESSION_TIMEOUT_SECONDS = 3600  # 1 hour session timeout
+
 # Ensure storage path exists
 REPO_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -1312,6 +1317,21 @@ async def mcp_messages(request: Request, session_id: str = Query(...)):
         return Response(status_code=202)
 
 
+def cleanup_expired_sessions():
+    """Remove expired HTTP sessions"""
+    now = datetime.utcnow()
+    expired = []
+    for sid, session in http_sessions.items():
+        age = (now - session["created_at"]).total_seconds()
+        if age > SESSION_TIMEOUT_SECONDS:
+            expired.append(sid)
+    for sid in expired:
+        del http_sessions[sid]
+        logger.info(f"[SESSION] Expired session removed: {sid[:8]}")
+    if expired:
+        logger.info(f"[SESSION] Cleaned up {len(expired)} expired sessions. Active: {len(http_sessions)}")
+
+
 @app.post("/sse")
 async def mcp_endpoint(request: Request):
     """
@@ -1323,23 +1343,49 @@ async def mcp_endpoint(request: Request):
     logger.info(f"[POST /sse] Request from {client_host}")
     logger.debug(f"[POST /sse] Request headers: {dict(request.headers)}")
 
-    # Get or create session ID for streamable HTTP transport
+    # Periodic cleanup of expired sessions
+    cleanup_expired_sessions()
+
+    # Get session ID from request header
     session_id = request.headers.get("mcp-session-id")
     is_new_session = False
+    protocol_version = request.headers.get("mcp-protocol-version", "2025-06-18")
 
     try:
         body = await request.json()
         base_url = get_base_url_from_request(request)
         method = body.get("method", "") if isinstance(body, dict) else ""
-        logger.info(f"[POST /sse] Body: {json.dumps(body)[:500]}...")
+        logger.info(f"[POST /sse] method={method}, session={session_id[:8] if session_id else 'none'}")
+        logger.debug(f"[POST /sse] Body: {json.dumps(body)[:500]}...")
 
-        # Generate new session ID on initialize
+        # Handle initialize - create new session
         if method == "initialize":
             session_id = str(uuid.uuid4())
             is_new_session = True
-            logger.info(f"[POST /sse] New session created: {session_id[:8]}")
+            # Get protocol version from request body
+            if isinstance(body, dict) and "params" in body:
+                protocol_version = body["params"].get("protocolVersion", protocol_version)
+            # Store session
+            http_sessions[session_id] = {
+                "created_at": datetime.utcnow(),
+                "last_used": datetime.utcnow(),
+                "protocol_version": protocol_version,
+                "client_host": client_host
+            }
+            logger.info(f"[POST /sse] New session created: {session_id[:8]}, protocol={protocol_version}, active_sessions={len(http_sessions)}")
+
+        # Validate existing session
         elif session_id:
-            logger.debug(f"[POST /sse] Using existing session: {session_id[:8]}")
+            if session_id in http_sessions:
+                http_sessions[session_id]["last_used"] = datetime.utcnow()
+                logger.debug(f"[POST /sse] Valid session: {session_id[:8]}")
+            else:
+                # Session not found - this might be why tools "drop"
+                # Be lenient: accept the request but log a warning
+                logger.warning(f"[POST /sse] Unknown session ID: {session_id[:8]} - accepting anyway")
+        else:
+            # No session ID provided for non-initialize request
+            logger.warning(f"[POST /sse] No session ID for method={method}")
 
         # Handle batch requests
         if isinstance(body, list):
@@ -1355,7 +1401,10 @@ async def mcp_endpoint(request: Request):
             mcp_response = await handle_mcp_request(body, base_url=base_url)
             if mcp_response is None:
                 logger.info("[POST /sse] No response (204)")
-                return Response(status_code=204)
+                resp = Response(status_code=204)
+                if session_id:
+                    resp.headers["Mcp-Session-Id"] = session_id
+                return resp
 
             logger.info(f"[POST /sse] Response: {json.dumps(mcp_response)[:200]}...")
             response = JSONResponse(content=mcp_response)
