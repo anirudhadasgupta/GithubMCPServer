@@ -17,6 +17,7 @@ import subprocess
 import zipfile
 import io
 import uuid
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Any
@@ -30,6 +31,14 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Configure logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("mcp-server")
+
 # Configuration
 GITHUB_PAT = os.getenv("GITHUB_PAT", "")
 REPO_STORAGE_PATH = Path(os.getenv("REPO_STORAGE_PATH", "/tmp/repos"))
@@ -37,6 +46,8 @@ ALLOWED_USERNAME = os.getenv("ALLOWED_USERNAME", "anirudhadasgupta")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 BASE_URL = os.getenv("BASE_URL", f"http://{HOST}:{PORT}")
+
+logger.info(f"Starting MCP server with BASE_URL={BASE_URL}, HOST={HOST}, PORT={PORT}")
 
 # Session management for SSE connections
 # Maps session_id -> asyncio.Queue for sending responses
@@ -792,6 +803,9 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
     params = request_data.get("params", {})
     request_id = request_data.get("id")
 
+    logger.info(f"[MCP] Handling method={method}, id={request_id}")
+    logger.debug(f"[MCP] Params: {params}")
+
     result = None
     error = None
 
@@ -1044,31 +1058,47 @@ async def sse_stream(request: Request):
     sse_sessions[session_id] = message_queue
 
     base_url = get_base_url_from_request(request)
+    client_host = request.client.host if request.client else "unknown"
+
+    logger.info(f"[SSE] New connection from {client_host}, session_id={session_id}")
+    logger.debug(f"[SSE] Request headers: {dict(request.headers)}")
+    logger.info(f"[SSE] Active sessions: {len(sse_sessions)}")
 
     async def event_generator():
+        heartbeat_count = 0
+        message_count = 0
         try:
             # Send the endpoint URL as the first event
             endpoint_url = f"{base_url}/messages?session_id={session_id}"
+            logger.info(f"[SSE:{session_id[:8]}] Sending endpoint URL: {endpoint_url}")
             yield f"event: endpoint\ndata: {endpoint_url}\n\n"
 
             while True:
                 # Check if client disconnected
                 if await request.is_disconnected():
+                    logger.warning(f"[SSE:{session_id[:8]}] Client disconnected after {heartbeat_count} heartbeats, {message_count} messages")
                     break
 
                 # Check for messages with timeout for heartbeat
                 try:
                     message = await asyncio.wait_for(message_queue.get(), timeout=15.0)
+                    message_count += 1
+                    logger.info(f"[SSE:{session_id[:8]}] Sending message #{message_count}: {json.dumps(message)[:200]}...")
                     yield f"event: message\ndata: {json.dumps(message)}\n\n"
                 except asyncio.TimeoutError:
                     # Send heartbeat ping
+                    heartbeat_count += 1
+                    logger.debug(f"[SSE:{session_id[:8]}] Heartbeat #{heartbeat_count}")
                     yield f"event: ping\ndata: {json.dumps({'type': 'ping', 'timestamp': datetime.utcnow().isoformat() + 'Z'})}\n\n"
 
         except asyncio.CancelledError:
-            pass
+            logger.warning(f"[SSE:{session_id[:8]}] Connection cancelled")
+        except Exception as e:
+            logger.error(f"[SSE:{session_id[:8]}] Error: {e}")
         finally:
             # Cleanup session
             sse_sessions.pop(session_id, None)
+            logger.info(f"[SSE:{session_id[:8]}] Session closed. Active sessions: {len(sse_sessions)}")
 
     return StreamingResponse(
         event_generator(),
@@ -1086,7 +1116,11 @@ async def mcp_messages(request: Request, session_id: str = Query(...)):
     """
     Receive MCP messages and push responses to the SSE stream.
     """
+    logger.info(f"[MSG:{session_id[:8]}] Received POST /messages")
+    logger.debug(f"[MSG:{session_id[:8]}] Request headers: {dict(request.headers)}")
+
     if session_id not in sse_sessions:
+        logger.error(f"[MSG:{session_id[:8]}] Session not found! Active sessions: {list(sse_sessions.keys())}")
         return JSONResponse(
             status_code=404,
             content={"error": "Session not found. Connect to /sse first."}
@@ -1097,9 +1131,11 @@ async def mcp_messages(request: Request, session_id: str = Query(...)):
 
     try:
         body = await request.json()
+        logger.info(f"[MSG:{session_id[:8]}] Request body: {json.dumps(body)[:500]}...")
 
         # Handle batch requests
         if isinstance(body, list):
+            logger.info(f"[MSG:{session_id[:8]}] Processing batch of {len(body)} requests")
             for req in body:
                 response = await handle_mcp_request(req, base_url=base_url)
                 if response is not None:
@@ -1107,11 +1143,13 @@ async def mcp_messages(request: Request, session_id: str = Query(...)):
         else:
             response = await handle_mcp_request(body, base_url=base_url)
             if response is not None:
+                logger.info(f"[MSG:{session_id[:8]}] Queued response: {json.dumps(response)[:200]}...")
                 await message_queue.put(response)
 
         return Response(status_code=202)  # Accepted
 
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.error(f"[MSG:{session_id[:8]}] JSON parse error: {e}")
         error_response = {
             "jsonrpc": "2.0",
             "error": {"code": -32700, "message": "Parse error"},
@@ -1120,6 +1158,7 @@ async def mcp_messages(request: Request, session_id: str = Query(...)):
         await message_queue.put(error_response)
         return Response(status_code=202)
     except Exception as e:
+        logger.error(f"[MSG:{session_id[:8]}] Error: {e}", exc_info=True)
         error_response = {
             "jsonrpc": "2.0",
             "error": {"code": -32603, "message": str(e)},
@@ -1135,12 +1174,18 @@ async def mcp_endpoint(request: Request):
     Direct MCP protocol endpoint (Streamable HTTP transport).
     For clients that don't use SSE, this provides direct request/response.
     """
+    client_host = request.client.host if request.client else "unknown"
+    logger.info(f"[POST /sse] Request from {client_host}")
+    logger.debug(f"[POST /sse] Request headers: {dict(request.headers)}")
+
     try:
         body = await request.json()
         base_url = get_base_url_from_request(request)
+        logger.info(f"[POST /sse] Body: {json.dumps(body)[:500]}...")
 
         # Handle batch requests
         if isinstance(body, list):
+            logger.info(f"[POST /sse] Processing batch of {len(body)} requests")
             responses = []
             for req in body:
                 resp = await handle_mcp_request(req, base_url=base_url)
@@ -1151,11 +1196,14 @@ async def mcp_endpoint(request: Request):
         # Handle single request
         response = await handle_mcp_request(body, base_url=base_url)
         if response is None:
+            logger.info("[POST /sse] No response (204)")
             return Response(status_code=204)
 
+        logger.info(f"[POST /sse] Response: {json.dumps(response)[:200]}...")
         return JSONResponse(content=response)
 
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.error(f"[POST /sse] JSON parse error: {e}")
         return JSONResponse(
             status_code=400,
             content={
@@ -1165,6 +1213,7 @@ async def mcp_endpoint(request: Request):
             }
         )
     except Exception as e:
+        logger.error(f"[POST /sse] Error: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content={
