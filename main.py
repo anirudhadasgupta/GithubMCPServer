@@ -49,6 +49,10 @@ BASE_URL = os.getenv("BASE_URL", f"http://{HOST}:{PORT}")
 
 logger.info(f"Starting MCP server with BASE_URL={BASE_URL}, HOST={HOST}, PORT={PORT}")
 
+# Response size limit (ChatGPT has ~100KB limit for action responses)
+MAX_RESPONSE_SIZE = int(os.getenv("MAX_RESPONSE_SIZE", "50000"))  # 50KB default
+logger.info(f"MAX_RESPONSE_SIZE={MAX_RESPONSE_SIZE}")
+
 # Session management for SSE connections
 # Maps session_id -> asyncio.Queue for sending responses
 sse_sessions: dict[str, asyncio.Queue] = {}
@@ -316,13 +320,18 @@ def validate_file_path(repo_path: Path, file_path: str) -> Optional[Path]:
 
 async def clone_repository_impl(repo_name: str) -> dict:
     """Clone a repository from the allowed username"""
+    logger.info(f"[TOOL:clone_repository] Starting clone for repo_name={repo_name}")
+
     if not validate_repo_name(repo_name):
+        logger.warning(f"[TOOL:clone_repository] Invalid repo name: {repo_name}")
         return {"error": "Invalid repository name", "success": False}
 
     repo_path = get_repo_path(repo_name)
+    logger.debug(f"[TOOL:clone_repository] repo_path={repo_path}")
 
     # Check if already cloned
     if repo_path.exists() and (repo_path / ".git").exists():
+        logger.info(f"[TOOL:clone_repository] Repo already exists, pulling latest")
         # Pull latest changes
         try:
             result = subprocess.run(
@@ -331,6 +340,7 @@ async def clone_repository_impl(repo_name: str) -> dict:
                 text=True,
                 timeout=60
             )
+            logger.info(f"[TOOL:clone_repository] Pull completed, returncode={result.returncode}")
             return {
                 "success": True,
                 "message": f"Repository '{repo_name}' already cloned. Updated with latest changes.",
@@ -338,6 +348,7 @@ async def clone_repository_impl(repo_name: str) -> dict:
                 "status": "updated"
             }
         except subprocess.TimeoutExpired:
+            logger.warning(f"[TOOL:clone_repository] Pull timed out")
             return {
                 "success": True,
                 "message": f"Repository '{repo_name}' exists (update timed out)",
@@ -350,10 +361,13 @@ async def clone_repository_impl(repo_name: str) -> dict:
 
     if GITHUB_PAT:
         clone_url = f"https://{GITHUB_PAT}@github.com/{ALLOWED_USERNAME}/{repo_name}.git"
+        logger.debug(f"[TOOL:clone_repository] Using PAT for authentication")
     else:
         clone_url = f"https://github.com/{ALLOWED_USERNAME}/{repo_name}.git"
+        logger.debug(f"[TOOL:clone_repository] No PAT, using public clone")
 
     try:
+        logger.info(f"[TOOL:clone_repository] Starting git clone")
         result = subprocess.run(
             ["git", "clone", "--depth", "1", clone_url, str(repo_path)],
             capture_output=True,
@@ -362,12 +376,14 @@ async def clone_repository_impl(repo_name: str) -> dict:
         )
 
         if result.returncode != 0:
+            logger.error(f"[TOOL:clone_repository] Clone failed: {result.stderr}")
             return {
                 "success": False,
                 "error": f"Failed to clone repository: {result.stderr}",
                 "status": "failed"
             }
 
+        logger.info(f"[TOOL:clone_repository] Clone successful")
         return {
             "success": True,
             "message": f"Successfully cloned '{ALLOWED_USERNAME}/{repo_name}'",
@@ -375,12 +391,14 @@ async def clone_repository_impl(repo_name: str) -> dict:
             "status": "cloned"
         }
     except subprocess.TimeoutExpired:
+        logger.error(f"[TOOL:clone_repository] Clone timed out after 120s")
         return {
             "success": False,
             "error": "Clone operation timed out",
             "status": "timeout"
         }
     except Exception as e:
+        logger.error(f"[TOOL:clone_repository] Exception: {e}", exc_info=True)
         return {
             "success": False,
             "error": str(e),
@@ -393,14 +411,18 @@ async def search_code_impl(
     pattern: str,
     file_pattern: Optional[str] = None,
     case_sensitive: bool = False,
-    max_results: int = 50
+    max_results: int = 20  # Reduced from 50 to prevent large responses
 ) -> dict:
-    """Search for code patterns using grep"""
+    """Search for code patterns using grep (Memory Safe Version)"""
+    logger.info(f"[TOOL:search_code] Starting search: repo={repo_name}, pattern={pattern[:50]}, file_pattern={file_pattern}, max_results={max_results}")
+
     if not validate_repo_name(repo_name):
+        logger.warning(f"[TOOL:search_code] Invalid repo name: {repo_name}")
         return {"error": "Invalid repository name", "matches": []}
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
+        logger.warning(f"[TOOL:search_code] Repo not found: {repo_path}")
         return {"error": f"Repository '{repo_name}' not cloned. Use clone_repository first.", "matches": []}
 
     matches = []
@@ -417,44 +439,72 @@ async def search_code_impl(
             grep_args.extend(["--include", file_pattern])
 
         grep_args.append(str(repo_path))
+        logger.debug(f"[TOOL:search_code] grep command: {' '.join(grep_args[:5])}...")
 
-        result = subprocess.run(
+        # Use Popen to stream output line-by-line (memory safe)
+        process = subprocess.Popen(
             grep_args,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=30,
             cwd=str(repo_path)
         )
+        logger.debug(f"[TOOL:search_code] Popen started, pid={process.pid}")
 
-        for line in result.stdout.split('\n')[:max_results]:
-            if not line.strip():
-                continue
+        match_count = 0
 
-            # Parse grep output: filename:line_number:content
-            parts = line.split(':', 2)
-            if len(parts) >= 3:
-                file_path = parts[0].replace(str(repo_path) + '/', '')
-                try:
-                    line_num = int(parts[1])
-                    content = parts[2]
-                    matches.append({
-                        "file": file_path,
-                        "line": line_num,
-                        "content": content.strip()[:500]  # Limit content length
-                    })
-                except (ValueError, IndexError):
+        # Iterate over stdout as it is generated
+        try:
+            for line in process.stdout:
+                if not line.strip():
                     continue
 
+                # Parse grep output: filename:line_number:content
+                parts = line.split(':', 2)
+                if len(parts) >= 3:
+                    file_path = parts[0].replace(str(repo_path) + '/', '')
+                    try:
+                        line_num = int(parts[1])
+                        content = parts[2]
+
+                        matches.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "content": content.strip()[:200]  # Limit content length
+                        })
+                        match_count += 1
+
+                        # Stop reading if we have enough results
+                        if match_count >= max_results:
+                            logger.info(f"[TOOL:search_code] Reached max_results={max_results}, terminating")
+                            process.terminate()
+                            break
+
+                    except (ValueError, IndexError):
+                        continue
+        finally:
+            # Clean up
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+        logger.info(f"[TOOL:search_code] Complete: {len(matches)} matches found")
         return {
             "success": True,
             "pattern": pattern,
             "matches": matches,
             "total_matches": len(matches),
-            "truncated": len(result.stdout.split('\n')) > max_results
+            "truncated": match_count >= max_results
         }
     except subprocess.TimeoutExpired:
+        logger.error(f"[TOOL:search_code] Search timed out")
         return {"error": "Search timed out", "matches": matches}
     except Exception as e:
+        logger.error(f"[TOOL:search_code] Exception: {e}", exc_info=True)
         return {"error": str(e), "matches": []}
 
 
@@ -465,18 +515,24 @@ async def get_tree_impl(
     show_hidden: bool = False
 ) -> dict:
     """Get directory tree structure"""
+    logger.info(f"[TOOL:get_tree] Starting: repo={repo_name}, path={path}, max_depth={max_depth}")
+
     if not validate_repo_name(repo_name):
+        logger.warning(f"[TOOL:get_tree] Invalid repo name: {repo_name}")
         return {"error": "Invalid repository name", "tree": ""}
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
+        logger.warning(f"[TOOL:get_tree] Repo not found: {repo_path}")
         return {"error": f"Repository '{repo_name}' not cloned. Use clone_repository first.", "tree": ""}
 
     target_path = validate_file_path(repo_path, path)
     if target_path is None:
+        logger.debug(f"[TOOL:get_tree] Invalid path, using repo root")
         target_path = repo_path
 
     if not target_path.exists():
+        logger.warning(f"[TOOL:get_tree] Path does not exist: {path}")
         return {"error": f"Path '{path}' does not exist", "tree": ""}
 
     def build_tree(current_path: Path, prefix: str = "", depth: int = 0) -> list:
@@ -511,6 +567,7 @@ async def get_tree_impl(
     tree_lines = [f"{target_path.name}/"]
     tree_lines.extend(build_tree(target_path))
 
+    logger.info(f"[TOOL:get_tree] Complete: {len(tree_lines)} lines in tree")
     return {
         "success": True,
         "repo_name": repo_name,
@@ -526,29 +583,38 @@ async def read_file_impl(
     end_line: int = 0
 ) -> dict:
     """Read file contents"""
+    logger.info(f"[TOOL:read_file] Starting: repo={repo_name}, file={file_path}, lines={start_line}-{end_line}")
+
     if not validate_repo_name(repo_name):
+        logger.warning(f"[TOOL:read_file] Invalid repo name: {repo_name}")
         return {"error": "Invalid repository name", "content": ""}
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
+        logger.warning(f"[TOOL:read_file] Repo not found: {repo_path}")
         return {"error": f"Repository '{repo_name}' not cloned. Use clone_repository first.", "content": ""}
 
     full_path = validate_file_path(repo_path, file_path)
     if full_path is None:
+        logger.warning(f"[TOOL:read_file] Invalid file path: {file_path}")
         return {"error": "Invalid file path", "content": ""}
 
     if not full_path.exists():
+        logger.warning(f"[TOOL:read_file] File not found: {full_path}")
         return {"error": f"File '{file_path}' not found", "content": ""}
 
     if not full_path.is_file():
+        logger.warning(f"[TOOL:read_file] Not a file: {full_path}")
         return {"error": f"'{file_path}' is not a file", "content": ""}
 
     try:
         # Check file size
         file_size = full_path.stat().st_size
         max_size = 1024 * 1024  # 1MB limit
+        logger.debug(f"[TOOL:read_file] File size: {file_size} bytes")
 
         if file_size > max_size:
+            logger.warning(f"[TOOL:read_file] File too large: {file_size} bytes")
             return {
                 "error": f"File too large ({file_size / 1024 / 1024:.1f} MB). Maximum size is 1MB.",
                 "content": ""
@@ -558,19 +624,26 @@ async def read_file_impl(
             lines = f.readlines()
 
         total_lines = len(lines)
+        logger.debug(f"[TOOL:read_file] Total lines: {total_lines}")
 
-        # Handle line ranges
+        # Handle line ranges - limit to 200 lines max to prevent large responses
+        MAX_LINES = 200
         start_idx = max(0, start_line - 1)
-        end_idx = total_lines if end_line <= 0 else min(end_line, total_lines)
+        if end_line <= 0:
+            end_idx = min(start_idx + MAX_LINES, total_lines)
+        else:
+            end_idx = min(end_line, start_idx + MAX_LINES, total_lines)
 
         selected_lines = lines[start_idx:end_idx]
+        was_truncated = (end_line <= 0 and total_lines > end_idx) or (end_line > 0 and end_line > end_idx)
 
         # Add line numbers
         numbered_content = []
         for i, line in enumerate(selected_lines, start=start_idx + 1):
             numbered_content.append(f"{i:4d} | {line.rstrip()}")
 
-        return {
+        logger.info(f"[TOOL:read_file] Complete: {len(selected_lines)} lines returned, truncated={was_truncated}")
+        result = {
             "success": True,
             "repo_name": repo_name,
             "file_path": file_path,
@@ -580,38 +653,53 @@ async def read_file_impl(
             "end_line": end_idx,
             "file_size": file_size
         }
+        if was_truncated:
+            result["truncated"] = True
+            result["note"] = f"Output limited to {MAX_LINES} lines. Use start_line/end_line to read other sections."
+        return result
     except UnicodeDecodeError:
+        logger.error(f"[TOOL:read_file] Binary file: {file_path}")
         return {"error": "Cannot read binary file", "content": ""}
     except Exception as e:
+        logger.error(f"[TOOL:read_file] Exception: {e}", exc_info=True)
         return {"error": str(e), "content": ""}
 
 
 async def get_outline_impl(repo_name: str, file_path: str) -> dict:
     """Get code outline for a file"""
+    logger.info(f"[TOOL:get_outline] Starting: repo={repo_name}, file={file_path}")
+
     if not validate_repo_name(repo_name):
+        logger.warning(f"[TOOL:get_outline] Invalid repo name: {repo_name}")
         return {"error": "Invalid repository name", "outline": []}
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
+        logger.warning(f"[TOOL:get_outline] Repo not found: {repo_path}")
         return {"error": f"Repository '{repo_name}' not cloned. Use clone_repository first.", "outline": []}
 
     full_path = validate_file_path(repo_path, file_path)
     if full_path is None:
+        logger.warning(f"[TOOL:get_outline] Invalid file path: {file_path}")
         return {"error": "Invalid file path", "outline": []}
 
     if not full_path.exists():
+        logger.warning(f"[TOOL:get_outline] File not found: {full_path}")
         return {"error": f"File '{file_path}' not found", "outline": []}
 
     outline = []
+    logger.debug(f"[TOOL:get_outline] Processing file: {full_path}")
 
     try:
         with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
 
         ext = full_path.suffix.lower()
+        logger.debug(f"[TOOL:get_outline] File extension: {ext}, content length: {len(content)}")
 
         # Python files - use AST
         if ext == '.py':
+            logger.debug(f"[TOOL:get_outline] Parsing Python file with AST")
             try:
                 tree = ast.parse(content)
                 for node in ast.walk(tree):
@@ -641,8 +729,8 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
                             "line": node.lineno,
                             "end_line": getattr(node, 'end_lineno', node.lineno)
                         })
-            except SyntaxError:
-                pass
+            except SyntaxError as e:
+                logger.warning(f"[TOOL:get_outline] Python syntax error: {e}")
 
         # JavaScript/TypeScript - regex based
         elif ext in ['.js', '.ts', '.jsx', '.tsx']:
@@ -699,6 +787,7 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
         # Sort by line number
         outline.sort(key=lambda x: x['line'])
 
+        logger.info(f"[TOOL:get_outline] Complete: {len(outline)} items found in {ext} file")
         return {
             "success": True,
             "repo_name": repo_name,
@@ -708,6 +797,7 @@ async def get_outline_impl(repo_name: str, file_path: str) -> dict:
             "total_items": len(outline)
         }
     except Exception as e:
+        logger.error(f"[TOOL:get_outline] Exception: {e}", exc_info=True)
         return {"error": str(e), "outline": []}
 
 
@@ -731,11 +821,16 @@ async def archive_repository_impl(
 
     ChatGPT can use the download_url to fetch and extract the repository.
     """
+    logger.info(f"[TOOL:archive_repository] Starting: repo={repo_name}, path={path}, include_hidden={include_hidden}")
+    logger.debug(f"[TOOL:archive_repository] base_url parameter: {base_url}")
+
     if not validate_repo_name(repo_name):
+        logger.warning(f"[TOOL:archive_repository] Invalid repo name: {repo_name}")
         return {"error": "Invalid repository name", "success": False}
 
     repo_path = get_repo_path(repo_name)
     if not repo_path.exists():
+        logger.warning(f"[TOOL:archive_repository] Repo not found: {repo_path}")
         return {
             "error": f"Repository '{repo_name}' not cloned. Use clone_repository first.",
             "success": False
@@ -743,19 +838,26 @@ async def archive_repository_impl(
 
     # Determine the target path to archive
     if path:
+        logger.debug(f"[TOOL:archive_repository] Validating subpath: {path}")
         target_path = validate_file_path(repo_path, path)
         if target_path is None:
+            logger.warning(f"[TOOL:archive_repository] Invalid path: {path}")
             return {"error": "Invalid path specified", "success": False}
         if not target_path.exists():
+            logger.warning(f"[TOOL:archive_repository] Path does not exist: {path}")
             return {"error": f"Path '{path}' does not exist", "success": False}
         if not target_path.is_dir():
+            logger.warning(f"[TOOL:archive_repository] Path is not a directory: {path}")
             return {"error": f"Path '{path}' is not a directory", "success": False}
         archive_name = f"{repo_name}_{target_path.name}"
     else:
         target_path = repo_path
         archive_name = repo_name
 
+    logger.debug(f"[TOOL:archive_repository] target_path={target_path}, archive_name={archive_name}")
+
     # Count files to give an estimate
+    logger.debug(f"[TOOL:archive_repository] Counting files in {target_path}")
     file_count = 0
     for file_path in target_path.rglob('*'):
         # Skip .git directory
@@ -769,9 +871,12 @@ async def archive_repository_impl(
         if file_path.is_file():
             file_count += 1
 
+    logger.debug(f"[TOOL:archive_repository] Found {file_count} files to archive")
+
     # Build download URL with query parameters
     # Use provided base_url (from request) or fall back to configured BASE_URL
     effective_base_url = base_url or BASE_URL
+    logger.debug(f"[TOOL:archive_repository] Using effective_base_url: {effective_base_url}")
     download_url = f"{effective_base_url}/download/{repo_name}"
     query_params = []
     if include_hidden:
@@ -781,6 +886,7 @@ async def archive_repository_impl(
     if query_params:
         download_url += "?" + "&".join(query_params)
 
+    logger.info(f"[TOOL:archive_repository] Complete: download_url={download_url}, file_count={file_count}")
     return {
         "success": True,
         "repo_name": repo_name,
@@ -797,6 +903,35 @@ async def archive_repository_impl(
 # MCP Protocol Handler
 # ============================================================================
 
+def truncate_response(response: dict, max_size: int = MAX_RESPONSE_SIZE) -> dict:
+    """Truncate response if it exceeds max size to prevent connection issues."""
+    response_str = json.dumps(response)
+    original_size = len(response_str)
+
+    if original_size <= max_size:
+        return response
+
+    logger.warning(f"[TRUNCATE] Response too large: {original_size} bytes, truncating to {max_size}")
+
+    # Try to truncate the content inside the response
+    if "result" in response and "content" in response["result"]:
+        content = response["result"]["content"]
+        if isinstance(content, list):
+            for item in content:
+                if item.get("type") == "text" and "text" in item:
+                    text = item["text"]
+                    # Calculate how much we need to trim
+                    overhead = original_size - len(text)
+                    max_text_size = max_size - overhead - 200  # Leave room for truncation message
+
+                    if len(text) > max_text_size:
+                        truncated_text = text[:max_text_size]
+                        item["text"] = truncated_text + f"\n\n... [TRUNCATED: Response was {original_size} bytes, limit is {max_size} bytes. Use more specific queries or smaller file ranges.]"
+                        logger.info(f"[TRUNCATE] Truncated text from {len(text)} to {len(item['text'])} chars")
+
+    return response
+
+
 async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
     """Handle MCP JSON-RPC requests"""
     method = request_data.get("method", "")
@@ -812,8 +947,11 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
     try:
         # Initialize
         if method == "initialize":
+            # Echo back the client's protocol version for compatibility
+            client_protocol = params.get("protocolVersion", "2025-06-18")
+            logger.info(f"[MCP] Client protocol version: {client_protocol}")
             result = {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": client_protocol,
                 "serverInfo": {
                     "name": "github-search-mcp",
                     "version": "1.0.0"
@@ -898,6 +1036,12 @@ async def handle_mcp_request(request_data: dict, base_url: str = "") -> dict:
         response["error"] = error
     else:
         response["result"] = result
+
+    # Truncate if response is too large
+    response = truncate_response(response)
+
+    response_size = len(json.dumps(response))
+    logger.info(f"[MCP] Response size: {response_size} bytes")
 
     return response
 
