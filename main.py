@@ -1012,7 +1012,7 @@ async def download_repository(
     )
 
 
-@app.post("/mcp")
+@app.post("/sse")
 async def mcp_endpoint(request: Request):
     """Main MCP protocol endpoint (Streamable HTTP transport)"""
     try:
@@ -1073,7 +1073,7 @@ async def root():
         "name": "GitHub Search MCP Server",
         "version": "1.0.0",
         "endpoints": {
-            "mcp": "/mcp",
+            "sse": "/sse",
             "health": "/health",
             "capabilities": "/capabilities",
             "download": "/download/{repo_name}"
