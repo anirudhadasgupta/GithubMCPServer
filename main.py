@@ -1317,15 +1317,29 @@ async def mcp_endpoint(request: Request):
     """
     Direct MCP protocol endpoint (Streamable HTTP transport).
     For clients that don't use SSE, this provides direct request/response.
+    Supports Mcp-Session-Id header for session management.
     """
     client_host = request.client.host if request.client else "unknown"
     logger.info(f"[POST /sse] Request from {client_host}")
     logger.debug(f"[POST /sse] Request headers: {dict(request.headers)}")
 
+    # Get or create session ID for streamable HTTP transport
+    session_id = request.headers.get("mcp-session-id")
+    is_new_session = False
+
     try:
         body = await request.json()
         base_url = get_base_url_from_request(request)
+        method = body.get("method", "") if isinstance(body, dict) else ""
         logger.info(f"[POST /sse] Body: {json.dumps(body)[:500]}...")
+
+        # Generate new session ID on initialize
+        if method == "initialize":
+            session_id = str(uuid.uuid4())
+            is_new_session = True
+            logger.info(f"[POST /sse] New session created: {session_id[:8]}")
+        elif session_id:
+            logger.debug(f"[POST /sse] Using existing session: {session_id[:8]}")
 
         # Handle batch requests
         if isinstance(body, list):
@@ -1335,20 +1349,28 @@ async def mcp_endpoint(request: Request):
                 resp = await handle_mcp_request(req, base_url=base_url)
                 if resp is not None:
                     responses.append(resp)
-            return JSONResponse(content=responses)
+            response = JSONResponse(content=responses)
+        else:
+            # Handle single request
+            mcp_response = await handle_mcp_request(body, base_url=base_url)
+            if mcp_response is None:
+                logger.info("[POST /sse] No response (204)")
+                return Response(status_code=204)
 
-        # Handle single request
-        response = await handle_mcp_request(body, base_url=base_url)
-        if response is None:
-            logger.info("[POST /sse] No response (204)")
-            return Response(status_code=204)
+            logger.info(f"[POST /sse] Response: {json.dumps(mcp_response)[:200]}...")
+            response = JSONResponse(content=mcp_response)
 
-        logger.info(f"[POST /sse] Response: {json.dumps(response)[:200]}...")
-        return JSONResponse(content=response)
+        # Include session ID in response headers
+        if session_id:
+            response.headers["Mcp-Session-Id"] = session_id
+            if is_new_session:
+                logger.info(f"[POST /sse] Returning new Mcp-Session-Id: {session_id[:8]}")
+
+        return response
 
     except json.JSONDecodeError as e:
         logger.error(f"[POST /sse] JSON parse error: {e}")
-        return JSONResponse(
+        error_response = JSONResponse(
             status_code=400,
             content={
                 "jsonrpc": "2.0",
@@ -1356,9 +1378,12 @@ async def mcp_endpoint(request: Request):
                 "id": None
             }
         )
+        if session_id:
+            error_response.headers["Mcp-Session-Id"] = session_id
+        return error_response
     except Exception as e:
         logger.error(f"[POST /sse] Error: {e}", exc_info=True)
-        return JSONResponse(
+        error_response = JSONResponse(
             status_code=500,
             content={
                 "jsonrpc": "2.0",
@@ -1366,6 +1391,9 @@ async def mcp_endpoint(request: Request):
                 "id": None
             }
         )
+        if session_id:
+            error_response.headers["Mcp-Session-Id"] = session_id
+        return error_response
 
 
 @app.get("/")
